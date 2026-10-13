@@ -92,6 +92,49 @@ struct GlyphCacheLayout {
     std::uint32_t row_gap;
 };
 
+// A launcher before the game starts (ui/launcher.hpp): a side bar with the
+// game's logo and the pages of the menu, a home page with a banner and quick
+// settings, and a Play button. Its colours are also the interface's: the menu
+// and the setup take them too.
+//
+// Art is the player's: images in the launcher folder (<data>/launcher/, or
+// Resources/launcher/ in an app) when they are there, else read from their
+// disc image. The port carries none.
+struct LauncherTheme {
+    // The title, in the side bar when there is no logo: "GOD OF WAR" over
+    // "GHOST OF SPARTA".
+    const char *title = nullptr;
+    const char *subtitle = nullptr;
+    // TrueType fonts for the title and the headings; empty: a serif face of
+    // the system's, else the interface's.
+    std::span<const std::uint8_t> title_font = {};
+    std::span<const std::uint8_t> heading_font = {};
+    // Colours, 0xRRGGBB.
+    std::uint32_t background = 0x161414u;     // the pages
+    std::uint32_t sidebar = 0x0F0E0Eu;        // the side bar and the bottom bar
+    std::uint32_t panel = 0x1C1919u;          // the in-game menu's panel
+    std::uint32_t accent = 0xA3161Au;         // the Play button, the selected page
+    std::uint32_t accent_bright = 0xD8343Au;  // headings, highlights
+    std::uint32_t text = 0xE8E4DFu;
+    std::uint32_t text_dim = 0x9C9590u;
+    // The banner on the home page: a file in the launcher folder, else an
+    // image on the disc. `backdrop_focus_y` is the part of its height kept in
+    // view when it is cropped to the banner's shape: 0 the top, 1 the bottom.
+    const char *backdrop_file = "background.jpg";
+    const char *backdrop_on_disc = "PSP_GAME/PIC1.PNG";
+    float backdrop_focus_y = 0.5f;
+    // The logo at the top of the side bar, likewise. `logo_on_black`: the
+    // image is the logo on black, which is made transparent and cropped away.
+    const char *logo_file = "logo.jpg";
+    const char *logo_on_disc = "PSP_GAME/ICON0.PNG";
+    bool logo_on_black = false;
+    // Where the port lives, shown at the foot of the home page; null: not shown.
+    const char *project_url = nullptr;
+    const char *issues_url = nullptr;
+    // A line of credits for the home page; null: none.
+    const char *credits = nullptr;
+};
+
 // A driver for the game's own camera. Every member may be null; the framework
 // reads camera/camera_driver.hpp's defaults for those.
 struct CameraDriver {
@@ -212,6 +255,9 @@ struct GameProfile {
     // agree on it, so it is the original release's code even when the port's
     // disc id is a different one.
     const char *adhoc_product_code;
+    // Whether the game plays with other players at all. False: the menu has
+    // no Network page and nothing about multiplayer.
+    bool adhoc_play = true;
 
     // --- Controls ----------------------------------------------------------
     // What the triggers may press instead of L and R, for the way this game is
@@ -292,6 +338,11 @@ struct GameProfile {
     // Where the game caches the glyphs it has drawn. Null: a font changed while
     // the game runs applies to text the game has not drawn yet.
     const GlyphCacheLayout *glyph_cache = nullptr;
+
+    // --- Launcher ----------------------------------------------------------
+    // Shown before the game starts, unless the player chose to skip it or
+    // started with --play. Null: the game starts at once, as it always has.
+    const LauncherTheme *launcher = nullptr;
 };
 
 // Defined by the port, exactly once. Everything under host/ reads the game

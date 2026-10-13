@@ -57,7 +57,8 @@
 namespace portablekit::gpu {
 
 std::string default_window_title() {
-    std::string title = portablekit::game().app_name;
+    // What the player calls the port, not the executable's name.
+    std::string title = portablekit::game().project_name;
     if (*kBuildLabel != '\0') title += std::string(" (") + kBuildLabel + ")";
     return title;
 }
@@ -1598,6 +1599,7 @@ struct VulkanRenderer::Impl {
     void submit_frame();
 
     Texture white_texture{};
+    std::vector<Texture> ui_images;  // create_ui_image()
     std::map<std::uint64_t, Texture> textures;
     // HD texture pack (texture_pack.hpp). `pack` is null while the setting
     // is off or no pack is installed; turning the setting on or off takes
@@ -5605,6 +5607,17 @@ void VulkanRenderer::begin_ui_frame() {
     if (impl_ && impl_->ui_ready) ImGui_ImplVulkan_NewFrame();
 }
 
+std::uint64_t VulkanRenderer::create_ui_image(std::uint32_t width, std::uint32_t height,
+                                              const std::uint32_t *pixels) {
+    if (!impl_ || !impl_->ui_ready || width == 0u || height == 0u || pixels == nullptr) return 0u;
+    Impl &impl = *impl_;
+    Impl::Texture texture = impl.create_texture(width, height, pixels);
+    if (texture.view == VK_NULL_HANDLE) return 0u;
+    const VkDescriptorSet set = ImGui_ImplVulkan_AddTexture(texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    impl.ui_images.push_back(texture);
+    return reinterpret_cast<std::uint64_t>(set);
+}
+
 void VulkanRenderer::set_ui_draw_data(ImDrawData *draw_data) {
     if (impl_) impl_->ui_draw_data = draw_data;
 }
@@ -7998,6 +8011,8 @@ void VulkanRenderer::shutdown() {
     Impl &impl = *impl_;
     vkDeviceWaitIdle(impl.device);
     // The interface may still be up when the game quits from its menu.
+    for (Impl::Texture &image : impl.ui_images) impl.destroy_texture(image);
+    impl.ui_images.clear();
     if (impl.ui_ready && ImGui::GetCurrentContext() != nullptr) ImGui_ImplVulkan_Shutdown();
     impl.ui_ready = false;
     impl.destroy_swapchain_views();

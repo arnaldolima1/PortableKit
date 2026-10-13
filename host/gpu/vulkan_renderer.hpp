@@ -263,6 +263,11 @@ public:
     void begin_ui_frame();
     // Draw data from ImGui::Render, drawn over the next presented image.
     void set_ui_draw_data(ImDrawData *draw_data);
+    // An RGBA image (8 bits a channel, rows top first) the interface can draw
+    // with ImGui::Image, kept until the renderer is destroyed. Zero when the
+    // interface is not up. Call between interface frames.
+    [[nodiscard]] std::uint64_t create_ui_image(std::uint32_t width, std::uint32_t height,
+                                                const std::uint32_t *pixels);
     // Presents a frame outside the game's own flips: the last game frame when
     // there is one and `show_game` is set, a plain background otherwise, with
     // the interface over it. Used while the game is paused or not started.

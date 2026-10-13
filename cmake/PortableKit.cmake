@@ -101,7 +101,9 @@ set(PORTABLEKIT_RENDERER_SOURCES
     host/ui/font_menu.cpp
     host/input/motion.cpp
     host/input/steam_deck_imu.cpp
+    host/ui/i18n.cpp
     host/ui/input_script.cpp
+    host/ui/launcher.cpp
     host/ui/layer.cpp
     host/ui/menu.cpp
     host/ui/save_screen.cpp

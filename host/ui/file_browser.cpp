@@ -55,7 +55,7 @@ bool chip(const char *id, const std::string &text, bool active = false) {
                   std::round((focused ? 2.0f : 1.5f) * scale));
     const ImVec2 text_size = ImGui::CalcTextSize(text.c_str());
     draw->AddText({min.x + (size.x - text_size.x) * 0.5f, min.y + (size.y - text_size.y) * 0.5f},
-                  active ? colors::kPanel : colors::kText, text.c_str());
+                  active ? colors::kOnAccent : colors::kText, text.c_str());
     ImGui::SameLine(0.0f, std::round(8.0f * scale));
     return pressed;
 }

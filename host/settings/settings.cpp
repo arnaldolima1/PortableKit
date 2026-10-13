@@ -419,6 +419,14 @@ const std::vector<Field> &fields() {
          }},
         BOOL_FIELD("ui.menu_hint_seen", menu_hint_seen),
         BOOL_FIELD("saves.backup_timestamp", backup_timestamp),
+        BOOL_FIELD("launcher.skip", launcher_skip),
+        BOOL_FIELD("launcher.backup", launcher_backup),
+        {"ui.language", nullptr,
+         [](Settings &s, const std::string &t) {
+             s.language = t;
+             return true;
+         },
+         [](const Settings &s) { return s.language; }, nullptr},
         {"ui.last_folder", nullptr,
          [](Settings &s, const std::string &t) {
              s.last_folder = t;

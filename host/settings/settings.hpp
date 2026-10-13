@@ -132,6 +132,9 @@ struct Settings {
     bool menu_pause_multiplayer{};     // ...also during ad hoc play, where a paused game stops answering its peers
     bool menu_hint_seen{};             // the "Esc / L3+R3 opens the menu" hint was shown
     std::string last_folder;           // where the setup's file browser was last used
+    bool launcher_skip{};              // start the game at once instead of showing the launcher
+    bool launcher_backup{true};        // back the saves up each time the launcher starts the game
+    std::string language;              // the interface's language: "en", "pt"; empty: the system's
 
     // Saves
     bool backup_timestamp{true};       // a backup made from the menu goes to a new folder named by its time
