@@ -3812,9 +3812,25 @@ void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overw
     if (target == nullptr) return;
     if (!target->initialized) {
         // Attachments are loaded, not cleared, so a new target starts undefined:
-        // move it into the layouts the render pass expects once.
-        transition(command_buffer, target->color, VK_IMAGE_LAYOUT_UNDEFINED,
-                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        // move it into the layouts the render pass expects once. Its colour
+        // starts as zeros, as the PSP's VRAM does: a game that draws only part
+        // of a buffer and samples around it (a bloom chain drawn side by side
+        // in one 512-wide buffer, each step at its own address) reads those
+        // pixels, and undefined contents show through (magenta on MoltenVK).
+        // <prefix>_NO_TARGET_CLEAR leaves them undefined, as before.
+        static const bool no_target_clear = portablekit::env("NO_TARGET_CLEAR") != nullptr;
+        if (no_target_clear) {
+            transition(command_buffer, target->color, VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        } else {
+            transition(command_buffer, target->color, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            const VkClearColorValue zero{{0.0f, 0.0f, 0.0f, 0.0f}};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+            vkCmdClearColorImage(command_buffer, target->color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1u,
+                                 &range);
+            transition(command_buffer, target->color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
         transition(command_buffer, target->depth, VK_IMAGE_LAYOUT_UNDEFINED,
                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, depth_aspect());
         target->initialized = true;

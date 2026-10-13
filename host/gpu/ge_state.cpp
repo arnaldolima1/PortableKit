@@ -1359,7 +1359,8 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
 
     // <prefix>_TRACE_GE_LIST=N[:M]: every command word of display list runs
     // N to N+M-1 (default one), counted from the first, to read what a
-    // screen is built from when it draws nothing sensible.
+    // screen is built from when it draws nothing sensible. Each run prints
+    // its first 20000 words; <prefix>_TRACE_GE_LIST_WORDS changes that.
     static const auto list_trace = []() -> std::pair<std::uint64_t, std::uint64_t> {
         const char *text = portablekit::env("TRACE_GE_LIST");
         if (text == nullptr) return {~0ull, 0ull};
@@ -1367,6 +1368,10 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
         const std::uint64_t first = std::strtoull(text, &end, 0);
         const std::uint64_t count = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 0) : 1ull;
         return {first, count};
+    }();
+    static const std::uint64_t list_trace_words = [] {
+        const char *text = portablekit::env("TRACE_GE_LIST_WORDS");
+        return text != nullptr ? std::strtoull(text, nullptr, 0) : 20000ull;
     }();
     static std::uint64_t runs = 0;
     const std::uint64_t run = runs++;
@@ -1377,7 +1382,7 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
         if (stall != 0u && pc == stall) return pc;
         if (!memory.contains(pc, 4u)) return pc;
         const std::uint32_t word = memory.load32(pc);
-        if (dump && steps < 20000u)
+        if (dump && steps < list_trace_words)
             std::cerr << "[ge-list] " << psprecomp::hex32(pc) << " " << psprecomp::hex32(word) << "\n";
         const std::uint32_t command = word >> 24u;
         const std::uint32_t data = word & 0x00FFFFFFu;
