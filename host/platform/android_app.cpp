@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -89,10 +90,30 @@ void unpack_bundled_resources() {
     portablekit::set_bundled_resource_directory(root);
 }
 
+// An app has no shell to set the <prefix>_* variables that switch on traces
+// and fallbacks in: env.txt in the app's internal storage holds them, one
+// NAME=value a line, read at start. Only `adb shell run-as` on a debuggable
+// build reaches that folder, so players never meet it.
+void load_environment_file() {
+    const char *storage = SDL_GetAndroidInternalStoragePath();
+    if (storage == nullptr) return;
+    std::ifstream in(std::filesystem::path(storage) / "env.txt");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::size_t equals = line.find('=');
+        if (line.empty() || line[0] == '#' || equals == std::string::npos || equals == 0u) continue;
+        const std::string name = line.substr(0, equals);
+        setenv(name.c_str(), line.c_str() + equals + 1u, 1);
+        std::printf("[env] %s from env.txt\n", name.c_str());
+    }
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
     redirect_output();
+    load_environment_file();
     // Back opens the in-game menu instead of leaving the app.
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     unpack_bundled_resources();

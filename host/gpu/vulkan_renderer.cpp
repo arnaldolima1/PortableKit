@@ -1081,6 +1081,16 @@ struct VulkanRenderer::Impl {
         // last drawn to. The renderer never writes guest memory, so a word that
         // has changed since means the game put something else there.
         std::vector<std::uint32_t> guest_words;
+        std::uint64_t snapshot_serial{};  // bumped by every new snapshot
+        // Ranges of guest memory compared word by word against this snapshot
+        // in frame `checked_frame`. A bloom chain samples the same buffer some
+        // thirty times a frame, and on a phone comparing every word each time
+        // cost milliseconds of cache misses: a range compared once in a frame
+        // is spot-checked after that, which still sees a texture written over
+        // the buffer (it changes nearly every word).
+        std::uint64_t checked_frame{~0ull};
+        std::uint64_t checked_snapshot{};
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> checked;
         // The copy that draws sample when the game textures from this buffer:
         // a render pass cannot read its own attachment.
         VkImage copy{};
@@ -1090,6 +1100,14 @@ struct VulkanRenderer::Impl {
         std::array<VkDescriptorSet, 2> copy_descriptors{};
         std::uint64_t copy_serial{};
         bool copy_valid{};
+        // The parts of the target the copy holds as of copy_serial: only what a
+        // texture reads is copied (a bloom chain reads a corner of its buffer
+        // twenty times a frame). <prefix>_NO_PARTIAL_COPIES copies all of it.
+        std::vector<VkRect2D> copied;
+        // Whether any draw has written depth here. Until one has, the depth
+        // attachment holds nothing worth keeping: passes neither load nor store
+        // it, which on a tiled GPU halves what each pass moves.
+        bool depth_written{};
     };
     std::map<std::uint32_t, Target> targets;
     // Write-back of the displayed framebuffer to guest VRAM (write_back_frame):
@@ -1224,6 +1242,11 @@ struct VulkanRenderer::Impl {
     // a tiled GPU then does not read the target from memory first.
     // <prefix>_NO_CLEAR_LOAD always loads, as before.
     std::array<VkRenderPass, 4> discard_passes{};
+    // Passes into a target whose depth was never written: depth is neither
+    // loaded nor stored. Indexed by whether colour is loaded (0) or not (1).
+    // <prefix>_NO_DEPTHLESS_PASSES uses the ordinary ones.
+    std::array<VkRenderPass, 2> depthless_passes{};
+    bool pass_depthless{};
     VkExtent2D target_extent{};
 
     VkShaderModule vertex_shader{};
@@ -1972,7 +1995,9 @@ struct VulkanRenderer::Impl {
     void update_display_info();
     // `overwritten`: bit 0, the pass's first draw writes every pixel's colour
     // and alpha; bit 1, every pixel's depth.
-    void begin_pass(std::uint32_t address, std::uint32_t overwritten = 0u);
+    // `writes_depth`: the draw that starts the pass writes depth, so the pass
+    // must keep it.
+    void begin_pass(std::uint32_t address, std::uint32_t overwritten = 0u, bool writes_depth = true);
     void end_pass();
     VkPipeline pipeline_for(const PipelineKey &key);
     Texture &texture_for(const GuestMemory &memory, const DrawCall &call);
@@ -1986,7 +2011,12 @@ struct VulkanRenderer::Impl {
     };
     [[nodiscard]] FramebufferTexture find_framebuffer_texture(const GuestMemory &memory,
                                                               const TextureState &texture);
-    VkDescriptorSet framebuffer_descriptor(Target &target, bool opaque);
+    // The sampled copy of `source.target`; the texture reads `width` x
+    // `height` guest pixels of it from (source.x, source.y).
+    VkDescriptorSet framebuffer_descriptor(const FramebufferTexture &source, std::uint32_t width,
+                                           std::uint32_t height, bool opaque);
+    // <prefix>_TRACE_PASSES: every render pass and target copy, one line each.
+    [[nodiscard]] std::uint32_t target_address(const Target &target) const;
     void snapshot_guest_words(const GuestMemory &memory, std::uint32_t address, Target &target);
     Texture create_texture(std::uint32_t width, std::uint32_t height, const std::uint32_t *pixels);
     // The image, view and descriptor of a texture, with no pixels yet.
@@ -2375,6 +2405,19 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
             variant_info.pAttachments = skipped.data();
             if (vkCreateRenderPass(impl.device, &variant_info, nullptr, &impl.discard_passes[variant]) != VK_SUCCESS)
                 impl.discard_passes[variant] = VK_NULL_HANDLE;
+        }
+    }
+    if (portablekit::env("NO_DEPTHLESS_PASSES") == nullptr) {
+        for (std::uint32_t variant = 0u; variant < 2u; ++variant) {
+            std::array<VkAttachmentDescription, 2> depthless = attachments;
+            if (variant == 1u) depthless[0].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            depthless[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            depthless[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            VkRenderPassCreateInfo variant_info = render_pass_info;
+            variant_info.pAttachments = depthless.data();
+            if (vkCreateRenderPass(impl.device, &variant_info, nullptr, &impl.depthless_passes[variant]) !=
+                VK_SUCCESS)
+                impl.depthless_passes[variant] = VK_NULL_HANDLE;
         }
     }
 
@@ -3808,7 +3851,7 @@ bool VulkanRenderer::Impl::create_upload(std::uint32_t width, std::uint32_t heig
     return true;
 }
 
-void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overwritten) {
+void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overwritten, bool writes_depth) {
     std::string error;
     Target *target = target_for(address, error);
     if (target == nullptr) return;
@@ -3837,8 +3880,11 @@ void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overw
                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, depth_aspect());
         target->initialized = true;
     }
+    if (writes_depth || (overwritten & 2u) != 0u) target->depth_written = true;
     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     pass.renderPass = discard_passes[overwritten & 3u] != VK_NULL_HANDLE ? discard_passes[overwritten & 3u] : render_pass;
+    pass_depthless = !target->depth_written && depthless_passes[overwritten & 1u] != VK_NULL_HANDLE;
+    if (pass_depthless) pass.renderPass = depthless_passes[overwritten & 1u];
     pass.framebuffer = target->framebuffer;
     pass.renderArea = {{0, 0}, target_extent};
     if (breadcrumbs.write != nullptr) {
@@ -3849,6 +3895,12 @@ void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overw
     }
     vkCmdBeginRenderPass(command_buffer, &pass, VK_SUBPASS_CONTENTS_INLINE);
     perf::count_render_pass();
+    static const bool trace_passes = portablekit::env("TRACE_PASSES") != nullptr;
+    if (trace_passes)
+        std::printf("[pass] frame %llu begin 0x%08x%s%s\n", static_cast<unsigned long long>(frames), address,
+                    pass_depthless ? " without depth" : "",
+                    (overwritten & 3u) == 3u ? " (colour and depth discarded)" : (overwritten & 1u) != 0u ? " (colour discarded)"
+                    : (overwritten & 2u) != 0u ? " (depth discarded)" : "");
     if ((overwritten & 3u) != 0u) perf::count_cleared_pass();
     forget_bindings();
     current_target = address;
@@ -4542,6 +4594,7 @@ void VulkanRenderer::Impl::record_writeback(std::uint32_t address) {
 void VulkanRenderer::Impl::snapshot_guest_words(const GuestMemory &memory, std::uint32_t address, Target &target) {
     const std::uint32_t bytes = target.stride * kPspHeight * framebuffer_bytes_per_pixel(target.format);
     target.guest_words.clear();
+    ++target.snapshot_serial;
     if (!memory.contains(address, bytes)) return;
     target.guest_words.reserve(bytes / 256u + 1u);
     for (std::uint32_t offset = 0; offset + 4u <= bytes; offset += 256u)
@@ -4580,11 +4633,43 @@ VulkanRenderer::Impl::FramebufferTexture VulkanRenderer::Impl::find_framebuffer_
     const std::uint64_t texture_end = static_cast<std::uint64_t>(texture_address) +
                                       static_cast<std::uint64_t>(texture.buffer_width) * texture.height *
                                           bytes_per_pixel;
-    for (std::size_t i = 0; i < best->guest_words.size(); ++i) {
-        const std::uint32_t word_address = best_base + static_cast<std::uint32_t>(i) * 256u;
-        if (word_address < texture_address || word_address >= texture_end) continue;
-        if (!memory.contains(word_address, 4u) || memory.load32(word_address) != best->guest_words[i]) return {};
+    // Only the words under the texture are compared, straight from guest
+    // memory where it is contiguous: a bloom chain samples a buffer some thirty
+    // times a frame, and a checked load for each of its words cost milliseconds
+    // a frame on a phone.
+    const auto end = static_cast<std::uint32_t>(std::min<std::uint64_t>(texture_end, 0xFFFFFFFFull));
+    const std::size_t first = (texture_address - best_base + 255u) / 256u;
+    const std::size_t last = std::min<std::size_t>(best->guest_words.size(), (end - best_base + 255u) / 256u);
+    // <prefix>_NO_FB_CHECK_CACHE compares every word every time.
+    static const bool full_always = portablekit::env("NO_FB_CHECK_CACHE") != nullptr;
+    if (best->checked_frame != frames || best->checked_snapshot != best->snapshot_serial) {
+        best->checked.clear();
+        best->checked_frame = frames;
+        best->checked_snapshot = best->snapshot_serial;
     }
+    const bool compared = !full_always && std::any_of(best->checked.begin(), best->checked.end(), [&](const auto &r) {
+        return texture_address >= r.first && end <= r.second;
+    });
+    // A range already compared this frame: 64 words spread over it.
+    const std::size_t step = compared ? std::max<std::size_t>(1u, (last - first) / 64u) : 1u;
+    if (first < last) {
+        const std::uint32_t first_address = best_base + static_cast<std::uint32_t>(first) * 256u;
+        const std::size_t span = (last - first - 1u) * 256u + 4u;
+        if (const std::uint8_t *words = memory.raw_pointer(first_address, span)) {
+            for (std::size_t i = first; i < last; i += step) {
+                std::uint32_t word;
+                std::memcpy(&word, words + (i - first) * 256u, sizeof(word));
+                if (word != best->guest_words[i]) return {};
+            }
+        } else {
+            for (std::size_t i = first; i < last; i += step) {
+                const std::uint32_t word_address = best_base + static_cast<std::uint32_t>(i) * 256u;
+                if (!memory.contains(word_address, 4u) || memory.load32(word_address) != best->guest_words[i])
+                    return {};
+            }
+        }
+    }
+    if (!compared) best->checked.emplace_back(texture_address, end);
     const std::uint32_t pixel = (texture_address - best_base) / bytes_per_pixel;
     FramebufferTexture found{best, pixel % best->stride, pixel / best->stride};
     if (found.x >= kPspWidth || found.y >= kPspHeight) return {};
@@ -4593,8 +4678,16 @@ VulkanRenderer::Impl::FramebufferTexture VulkanRenderer::Impl::find_framebuffer_
 
 // A sampled copy of the target, brought up to date with its latest draw. The
 // copy is recorded between render passes, so the pass in progress ends here.
-VkDescriptorSet VulkanRenderer::Impl::framebuffer_descriptor(Target &target, bool opaque) {
+std::uint32_t VulkanRenderer::Impl::target_address(const Target &target) const {
+    for (const auto &[address, candidate] : targets)
+        if (&candidate == &target) return address;
+    return 0u;
+}
+
+VkDescriptorSet VulkanRenderer::Impl::framebuffer_descriptor(const FramebufferTexture &source, std::uint32_t width,
+                                                             std::uint32_t height, bool opaque) {
     const perf::SplitScope split(perf::Split::Texture);
+    Target &target = *source.target;
     if (target.copy == VK_NULL_HANDLE) {
         std::string error;
         if (!create_image(target_extent.width, target_extent.height, VK_FORMAT_R8G8B8A8_UNORM,
@@ -4633,7 +4726,35 @@ VkDescriptorSet VulkanRenderer::Impl::framebuffer_descriptor(Target &target, boo
         }
         target.copy_valid = false;
     }
-    if (!target.copy_valid || target.copy_serial != target.draw_serial) {
+    // What the texture reads, in target pixels, with a margin for filtering:
+    // the target holds the game's 480x272 pixels at any internal scale.
+    static const bool no_partial = portablekit::env("NO_PARTIAL_COPIES") != nullptr;
+    VkRect2D wanted{{0, 0}, target_extent};
+    if (!no_partial) {
+        const double scale_x = static_cast<double>(target_extent.width) / kPspWidth;
+        const double scale_y = static_cast<double>(target_extent.height) / kPspHeight;
+        const auto margin_x = static_cast<std::int32_t>(std::ceil(scale_x)) + 1;
+        const auto margin_y = static_cast<std::int32_t>(std::ceil(scale_y)) + 1;
+        const auto x0 = static_cast<std::int32_t>(std::floor(source.x * scale_x)) - margin_x;
+        const auto y0 = static_cast<std::int32_t>(std::floor(source.y * scale_y)) - margin_y;
+        const auto x1 = static_cast<std::int32_t>(std::ceil((source.x + width) * scale_x)) + margin_x;
+        const auto y1 = static_cast<std::int32_t>(std::ceil((source.y + height) * scale_y)) + margin_y;
+        const std::int32_t left = std::clamp(x0, 0, static_cast<std::int32_t>(target_extent.width));
+        const std::int32_t top = std::clamp(y0, 0, static_cast<std::int32_t>(target_extent.height));
+        const std::int32_t right = std::clamp(x1, left, static_cast<std::int32_t>(target_extent.width));
+        const std::int32_t bottom = std::clamp(y1, top, static_cast<std::int32_t>(target_extent.height));
+        wanted = {{left, top}, {static_cast<std::uint32_t>(right - left), static_cast<std::uint32_t>(bottom - top)}};
+    }
+    if (wanted.extent.width == 0u || wanted.extent.height == 0u) wanted = {{0, 0}, target_extent};
+    if (target.copy_valid && target.copy_serial != target.draw_serial) target.copied.clear();
+    const bool held = target.copy_valid && std::any_of(target.copied.begin(), target.copied.end(), [&](const VkRect2D &r) {
+        return wanted.offset.x >= r.offset.x && wanted.offset.y >= r.offset.y &&
+               wanted.offset.x + static_cast<std::int32_t>(wanted.extent.width) <=
+                   r.offset.x + static_cast<std::int32_t>(r.extent.width) &&
+               wanted.offset.y + static_cast<std::int32_t>(wanted.extent.height) <=
+                   r.offset.y + static_cast<std::int32_t>(r.extent.height);
+    });
+    if (!held) {
         end_pass();
         transition(command_buffer, target.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -4643,14 +4764,23 @@ VkDescriptorSet VulkanRenderer::Impl::framebuffer_descriptor(Target &target, boo
         VkImageCopy region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
         region.dstSubresource = region.srcSubresource;
-        region.extent = {target_extent.width, target_extent.height, 1u};
+        region.srcOffset = {wanted.offset.x, wanted.offset.y, 0};
+        region.dstOffset = region.srcOffset;
+        region.extent = {wanted.extent.width, wanted.extent.height, 1u};
         vkCmdCopyImage(command_buffer, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target.copy,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
         perf::count_target_copy();
+        static const bool trace_passes = portablekit::env("TRACE_PASSES") != nullptr;
+        if (trace_passes)
+            std::printf("[pass] frame %llu copy 0x%08x while drawing into 0x%08x, read %ux%u at %u,%u: %ux%u copied\n",
+                        static_cast<unsigned long long>(frames), target_address(target), current_target, width,
+                        height, source.x, source.y, wanted.extent.width, wanted.extent.height);
         transition(command_buffer, target.copy, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         transition(command_buffer, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (!target.copy_valid || target.copy_serial != target.draw_serial) target.copied.clear();
+        target.copied.push_back(wanted);
         target.copy_serial = target.draw_serial;
         target.copy_valid = true;
     }
@@ -6485,7 +6615,8 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         const Impl::FramebufferTexture &source = framebuffer_source;
         const VkDescriptorSet copy =
             source.target != nullptr
-                ? impl.framebuffer_descriptor(*source.target, call.texture.format == TextureFormat::Rgba5650)
+                ? impl.framebuffer_descriptor(source, call.texture.width, call.texture.height,
+                                              call.texture.format == TextureFormat::Rgba5650)
                 : VK_NULL_HANDLE;
         if (copy != VK_NULL_HANDLE) {
             // Texture coordinates address the game's texture, whose first texel
@@ -6507,6 +6638,9 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         }
     }
 
+    // A draw that writes depth into a pass begun without it: the pass ends and
+    // one that keeps depth begins.
+    if (key.depth_write && impl.pass_active && impl.pass_depthless) impl.end_pass();
     if (!impl.pass_active || impl.current_target != call.target.color_address) {
         impl.end_pass();
         // A clear that covers the whole screen, first in its pass, writes
@@ -6528,7 +6662,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                 if ((call.clear_flags & 4u) != 0u) overwritten |= 2u;
             }
         }
-        impl.begin_pass(call.target.color_address, overwritten);
+        impl.begin_pass(call.target.color_address, overwritten, key.depth_write);
         if (!impl.pass_active) return;
     }
     {
@@ -8094,6 +8228,8 @@ void VulkanRenderer::shutdown() {
     for (VkFence fence : impl.present_fences) vkDestroyFence(impl.device, fence, nullptr);
     if (impl.present_timer != VK_NULL_HANDLE) vkDestroyQueryPool(impl.device, impl.present_timer, nullptr);
     vkDestroyRenderPass(impl.device, impl.render_pass, nullptr);
+    for (VkRenderPass pass : impl.depthless_passes)
+        if (pass != VK_NULL_HANDLE) vkDestroyRenderPass(impl.device, pass, nullptr);
     for (VkRenderPass pass : impl.discard_passes)
         if (pass != VK_NULL_HANDLE) vkDestroyRenderPass(impl.device, pass, nullptr);
     for (VkSemaphore semaphore : impl.image_available) vkDestroySemaphore(impl.device, semaphore, nullptr);

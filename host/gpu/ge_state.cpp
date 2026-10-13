@@ -941,14 +941,17 @@ struct IgnoredCommand {
     std::uint64_t count{};
     std::uint32_t first_value{};
 };
-std::map<std::uint32_t, IgnoredCommand> &ignored_commands() {
-    static std::map<std::uint32_t, IgnoredCommand> commands;
+// Indexed by the command (8 bits) or 0x0E00 | a signal's behaviour: a busy
+// frame ignores hundreds of commands, and a map lookup for each showed in
+// profiles.
+std::array<IgnoredCommand, 0x1000> &ignored_commands() {
+    static std::array<IgnoredCommand, 0x1000> commands{};
     return commands;
 }
 } // namespace
 
 void GeState::trace_unhandled(std::uint32_t command, std::uint32_t data) {
-    IgnoredCommand &entry = ignored_commands()[command];
+    IgnoredCommand &entry = ignored_commands()[command & 0xFFFu];
     if (entry.count == 0u) entry.first_value = data;
     ++entry.count;
     static const bool trace = portablekit::env("TRACE_FB_TEXTURES") != nullptr;
@@ -957,11 +960,18 @@ void GeState::trace_unhandled(std::uint32_t command, std::uint32_t data) {
 }
 
 void GeState::report_ignored_commands() {
-    if (ignored_commands().empty()) return;
-    std::cout << "GE commands ignored: " << ignored_commands().size() << " distinct\n";
-    for (const auto &[command, entry] : ignored_commands())
+    const auto &commands = ignored_commands();
+    const auto distinct = std::count_if(commands.begin(), commands.end(), [](const IgnoredCommand &entry) {
+        return entry.count != 0u;
+    });
+    if (distinct == 0) return;
+    std::cout << "GE commands ignored: " << distinct << " distinct\n";
+    for (std::uint32_t command = 0; command < commands.size(); ++command) {
+        const IgnoredCommand &entry = commands[command];
+        if (entry.count == 0u) continue;
         std::cout << "  0x" << std::hex << command << std::dec << " x" << entry.count << " first=0x" << std::hex
                   << entry.first_value << std::dec << "\n";
+    }
 }
 
 void GeState::fill_draw_state(DrawCall &call) const {
