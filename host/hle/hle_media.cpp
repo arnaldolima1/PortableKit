@@ -819,6 +819,19 @@ void register_vblank_waits(HleRegistrar &hle) {
     });
 }
 
+// <prefix>_TRACE_GE_CALLS: each list call with the real time it took and
+// the real time since the previous one, to see how a game feeds the GE.
+void trace_ge_call(const char *name, std::uint32_t id, std::chrono::steady_clock::time_point start) {
+    static const bool trace = portablekit::env("TRACE_GE_CALLS") != nullptr;
+    if (!trace) return;
+    static std::chrono::steady_clock::time_point previous = start;
+    const auto now = std::chrono::steady_clock::now();
+    std::printf("[gecall] %s %u took %.2f ms, %.2f ms after the previous call ended\n", name, id,
+                std::chrono::duration<double, std::milli>(now - start).count(),
+                std::chrono::duration<double, std::milli>(start - previous).count());
+    previous = now;
+}
+
 void register_ge(HleRegistrar &hle) {
     hle.add("sceGe_user", "sceGeEdramGetAddr", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, kEdramBase); });
     hle.add("sceGe_user", "sceGeEdramGetSize", [](Runtime &, AllegrexContext &ctx) { kernel().finish(ctx, kEdramSize); });
@@ -843,7 +856,9 @@ void register_ge(HleRegistrar &hle) {
         list.callback = static_cast<std::int32_t>(arg(ctx, 2));
         media().ge_lists[id] = std::move(list);
         perf::count_display_list();
+        const auto start = std::chrono::steady_clock::now();
         run_ge_list(rt, id);
+        trace_ge_call("enqueue", id, start);
         kernel().finish(ctx, id);
     };
     hle.add("sceGe_user", "sceGeListEnQueue", enqueue);
@@ -855,16 +870,20 @@ void register_ge(HleRegistrar &hle) {
             return;
         }
         found->second.stall = arg(ctx, 1) & 0x0FFFFFFFu;
+        const auto start = std::chrono::steady_clock::now();
         run_ge_list(rt, arg(ctx, 0));
+        trace_ge_call("stall", arg(ctx, 0), start);
         kernel().finish(ctx, 0u);
     });
     hle.add("sceGe_user", "sceGeListSync", [](Runtime &, AllegrexContext &ctx) {
+        trace_ge_call("listsync", arg(ctx, 0), std::chrono::steady_clock::now());
         auto found = media().ge_lists.find(arg(ctx, 0));
         // 0 = completed, 2 = still stalled (drawing).
         const std::uint32_t state = found == media().ge_lists.end() || found->second.done ? 0u : 2u;
         kernel().finish(ctx, state);
     });
     hle.add("sceGe_user", "sceGeDrawSync", [](Runtime &, AllegrexContext &ctx) {
+        trace_ge_call("drawsync", 0u, std::chrono::steady_clock::now());
         std::erase_if(media().ge_lists, [](const auto &item) { return item.second.done; });
         kernel().finish(ctx, 0u);
     });
