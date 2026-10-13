@@ -1104,6 +1104,14 @@ struct VulkanRenderer::Impl {
         // texture reads is copied (a bloom chain reads a corner of its buffer
         // twenty times a frame). <prefix>_NO_PARTIAL_COPIES copies all of it.
         std::vector<VkRect2D> copied;
+        // The part of the target the game draws into: the union of its draws'
+        // scissors this frame (area_frame, of frame area_frame_number) and in
+        // the frame it was drawn before (area_hint). A pass covers that much,
+        // not the whole target: a tiled GPU loads and stores only a pass's
+        // render area, and a bloom chain draws corners of its buffers.
+        VkRect2D area_hint{};
+        VkRect2D area_frame{};
+        std::uint64_t area_frame_number{~0ull};
         // Whether any draw has written depth here. Until one has, the depth
         // attachment holds nothing worth keeping: passes neither load nor store
         // it, which on a tiled GPU halves what each pass moves.
@@ -1247,6 +1255,37 @@ struct VulkanRenderer::Impl {
     // <prefix>_NO_DEPTHLESS_PASSES uses the ordinary ones.
     std::array<VkRenderPass, 2> depthless_passes{};
     bool pass_depthless{};
+    // The render area of the pass in progress, what its first draw found it
+    // could skip loading, and whether a draw has been recorded in it yet.
+    VkRect2D pass_area{};
+    std::uint32_t pass_overwritten{};
+    bool pass_drawn{};
+    [[nodiscard]] static bool area_empty(const VkRect2D &r) { return r.extent.width == 0u || r.extent.height == 0u; }
+    [[nodiscard]] static VkRect2D area_union(const VkRect2D &a, const VkRect2D &b) {
+        if (area_empty(a)) return b;
+        if (area_empty(b)) return a;
+        const std::int32_t left = std::min(a.offset.x, b.offset.x);
+        const std::int32_t top = std::min(a.offset.y, b.offset.y);
+        const std::int32_t right = std::max(a.offset.x + static_cast<std::int32_t>(a.extent.width),
+                                            b.offset.x + static_cast<std::int32_t>(b.extent.width));
+        const std::int32_t bottom = std::max(a.offset.y + static_cast<std::int32_t>(a.extent.height),
+                                             b.offset.y + static_cast<std::int32_t>(b.extent.height));
+        return {{left, top}, {static_cast<std::uint32_t>(right - left), static_cast<std::uint32_t>(bottom - top)}};
+    }
+    [[nodiscard]] static bool area_holds(const VkRect2D &outer, const VkRect2D &inner) {
+        return inner.offset.x >= outer.offset.x && inner.offset.y >= outer.offset.y &&
+               inner.offset.x + static_cast<std::int32_t>(inner.extent.width) <=
+                   outer.offset.x + static_cast<std::int32_t>(outer.extent.width) &&
+               inner.offset.y + static_cast<std::int32_t>(inner.extent.height) <=
+                   outer.offset.y + static_cast<std::int32_t>(outer.extent.height);
+    }
+    // Starts this frame's area of `target`, the last one becoming its hint.
+    void roll_area(Target &target) {
+        if (target.area_frame_number == frames) return;
+        if (!area_empty(target.area_frame)) target.area_hint = target.area_frame;
+        target.area_frame = {};
+        target.area_frame_number = frames;
+    }
     VkExtent2D target_extent{};
 
     VkShaderModule vertex_shader{};
@@ -3885,8 +3924,20 @@ void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overw
     pass.renderPass = discard_passes[overwritten & 3u] != VK_NULL_HANDLE ? discard_passes[overwritten & 3u] : render_pass;
     pass_depthless = !target->depth_written && depthless_passes[overwritten & 1u] != VK_NULL_HANDLE;
     if (pass_depthless) pass.renderPass = depthless_passes[overwritten & 1u];
+    // What the target is known to be drawn in; the whole of it for a target
+    // never drawn before. <prefix>_NO_PASS_AREA always takes the whole.
+    static const bool no_pass_area = portablekit::env("NO_PASS_AREA") != nullptr;
+    VkRect2D area{{0, 0}, target_extent};
+    if (!no_pass_area) {
+        roll_area(*target);
+        const VkRect2D known = area_union(target->area_hint, target->area_frame);
+        if (!area_empty(known)) area = known;
+    }
+    pass_area = area;
+    pass_overwritten = overwritten;
+    pass_drawn = false;
     pass.framebuffer = target->framebuffer;
-    pass.renderArea = {{0, 0}, target_extent};
+    pass.renderArea = area;
     if (breadcrumbs.write != nullptr) {
         char label[64];
         std::snprintf(label, sizeof(label), "render pass into 0x%08x%s", address,
@@ -3897,7 +3948,8 @@ void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overw
     perf::count_render_pass();
     static const bool trace_passes = portablekit::env("TRACE_PASSES") != nullptr;
     if (trace_passes)
-        std::printf("[pass] frame %llu begin 0x%08x%s%s\n", static_cast<unsigned long long>(frames), address,
+        std::printf("[pass] frame %llu begin 0x%08x %ux%u at %d,%d%s%s\n", static_cast<unsigned long long>(frames),
+                    address, area.extent.width, area.extent.height, area.offset.x, area.offset.y,
                     pass_depthless ? " without depth" : "",
                     (overwritten & 3u) == 3u ? " (colour and depth discarded)" : (overwritten & 1u) != 0u ? " (colour discarded)"
                     : (overwritten & 2u) != 0u ? " (depth discarded)" : "");
@@ -6744,6 +6796,61 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     VkRect2D vk_scissor{};
     vk_scissor.offset = {left, top};
     vk_scissor.extent = {static_cast<std::uint32_t>(right - left), static_cast<std::uint32_t>(bottom - top)};
+    // A draw outside the pass's render area: the pass begins again over the
+    // union, keeping what was drawn so far.
+    static const bool no_pass_area = portablekit::env("NO_PASS_AREA") != nullptr;
+    // What the draw can touch: its scissor, and within it the viewport a
+    // transformed draw is clipped to, or the box around a through-mode draw's
+    // vertices (in PSP pixels, with a pixel's margin). A game may leave the
+    // scissor at the whole screen and draw its bloom steps into corners.
+    VkRect2D reach = vk_scissor;
+    if (!no_pass_area && !fitted) {
+        float box[4]{};
+        bool boxed = false;
+        if (call.through && !call.vertices.empty()) {
+            box[0] = box[2] = call.vertices[0].position[0];
+            box[1] = box[3] = call.vertices[0].position[1];
+            for (const Vertex &vertex : call.vertices) {
+                box[0] = std::min(box[0], vertex.position[0]);
+                box[1] = std::min(box[1], vertex.position[1]);
+                box[2] = std::max(box[2], vertex.position[0]);
+                box[3] = std::max(box[3], vertex.position[1]);
+            }
+            box[0] = (box[0] - 1.0f) * scale_x;
+            box[1] = (box[1] - 1.0f) * scale_y;
+            box[2] = (box[2] + 1.0f) * scale_x;
+            box[3] = (box[3] + 1.0f) * scale_y;
+            boxed = true;
+        } else if (!call.through && vk_viewport.width != 0.0f && vk_viewport.height != 0.0f) {
+            box[0] = std::min(vk_viewport.x, vk_viewport.x + vk_viewport.width);
+            box[2] = std::max(vk_viewport.x, vk_viewport.x + vk_viewport.width);
+            box[1] = std::min(vk_viewport.y, vk_viewport.y + vk_viewport.height);
+            box[3] = std::max(vk_viewport.y, vk_viewport.y + vk_viewport.height);
+            boxed = true;
+        }
+        if (boxed) {
+            const std::int32_t l = std::max(vk_scissor.offset.x, static_cast<std::int32_t>(std::floor(box[0])));
+            const std::int32_t t = std::max(vk_scissor.offset.y, static_cast<std::int32_t>(std::floor(box[1])));
+            const std::int32_t r = std::min(vk_scissor.offset.x + static_cast<std::int32_t>(vk_scissor.extent.width),
+                                            static_cast<std::int32_t>(std::ceil(box[2])));
+            const std::int32_t b = std::min(vk_scissor.offset.y + static_cast<std::int32_t>(vk_scissor.extent.height),
+                                            static_cast<std::int32_t>(std::ceil(box[3])));
+            reach = r > l && b > t ? VkRect2D{{l, t}, {static_cast<std::uint32_t>(r - l), static_cast<std::uint32_t>(b - t)}}
+                                   : VkRect2D{};
+        }
+    }
+    if (!no_pass_area && !Impl::area_empty(reach)) {
+        Impl::Target &target = impl.targets.at(call.target.color_address);
+        impl.roll_area(target);
+        target.area_frame = Impl::area_union(target.area_frame, reach);
+        if (!Impl::area_holds(impl.pass_area, reach)) {
+            const std::uint32_t overwritten = impl.pass_drawn ? 0u : impl.pass_overwritten;
+            impl.end_pass();
+            impl.begin_pass(call.target.color_address, overwritten, key.depth_write);
+            if (!impl.pass_active) return;
+        }
+    }
+    impl.pass_drawn = true;
     const std::array<std::uint32_t, 3> lighting_offsets{impl.environment_offset, impl.object_offset, impl.raw_offset};
     if (merge) {
         const Impl::DrawState state{pipeline, texture_descriptor, lighting_offsets, vk_viewport, vk_scissor,
