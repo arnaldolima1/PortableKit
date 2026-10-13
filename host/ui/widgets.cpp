@@ -660,7 +660,60 @@ void heading(const std::string &text) {
     ImGui::Dummy({0.0f, px(4.0f)});
 }
 
+// Whether the screen is driven by touch rather than keys: on Android unless a
+// gamepad is in use, elsewhere when the last pointer was a finger.
+bool touch_driven() {
+    if (Layer::get().input_device() == InputDevice::Gamepad) return false;
+#if defined(__ANDROID__)
+    return true;
+#else
+    return ImGui::GetIO().MouseSource == ImGuiMouseSource_TouchScreen;
+#endif
+}
+
+// What a tap on a hint does, for the hints that stand for a request.
+bool press_hint(Control control) {
+    switch (control) {
+    case Control::Back: Layer::get().press_back(); return true;
+    case Control::Menu: Layer::get().press_menu_toggle(); return true;
+    default: return false;
+    }
+}
+
+// Touch: the hints that stand for a request become buttons, and the ones a
+// finger does by touching the row itself are left out.
+void touch_hints(std::initializer_list<Hint> list) {
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    float x = start.x;
+    const float height = std::round(font() * 1.7f);
+    const float y = start.y - (height - font()) * 0.5f;
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    for (const Hint &hint : list) {
+        if (hint.control != Control::Back && hint.control != Control::Menu) continue;
+        const char *text = tr(hint.text);
+        const ImVec2 size = ImGui::CalcTextSize(text);
+        const float width = size.x + font() * 1.6f;
+        ImGui::SetCursorScreenPos({x, y});
+        ImGui::PushID(static_cast<int>(hint.control));
+        if (ImGui::InvisibleButton("hint", {width, height})) press_hint(hint.control);
+        const bool held = ImGui::IsItemActive();
+        ImGui::PopID();
+        draw->AddRectFilled({x, y}, {x + width, y + height}, held ? colors::kRowFocus : colors::kRow, height * 0.5f);
+        draw->AddRect({x, y}, {x + width, y + height}, colors::kPanelEdge, height * 0.5f, 0, px(1.5f));
+        draw->AddText({x + (width - size.x) * 0.5f, y + (height - size.y) * 0.5f}, colors::kText, text);
+        x += width + px(14.0f);
+    }
+    ImGui::PopItemFlag();
+    ImGui::SetCursorScreenPos(start);
+    ImGui::Dummy({std::max(0.0f, x - start.x), font()});
+}
+
 void hints(std::initializer_list<Hint> list) {
+    if (touch_driven()) {
+        touch_hints(list);
+        return;
+    }
     ImDrawList *draw = ImGui::GetWindowDrawList();
     const bool pad = Layer::get().input_device() == InputDevice::Gamepad;
     const bool south = Layer::get().confirm_south();
@@ -727,7 +780,19 @@ void hints(std::initializer_list<Hint> list) {
         }
         const char *text = tr(hint.text);
         draw->AddText({x + px(2.0f), at.y}, colors::kTextDim, text);
-        at.x = x + ImGui::CalcTextSize(text).x + px(26.0f);
+        const float end = x + ImGui::CalcTextSize(text).x + px(2.0f);
+        // A click on a hint that stands for a request makes it.
+        if (hint.control == Control::Back || hint.control == Control::Menu) {
+            const ImVec2 cursor = ImGui::GetCursorScreenPos();
+            ImGui::SetCursorScreenPos(at);
+            ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+            ImGui::PushID(static_cast<int>(hint.control));
+            if (ImGui::InvisibleButton("hint", {std::max(1.0f, end - at.x), font()})) press_hint(hint.control);
+            ImGui::PopID();
+            ImGui::PopItemFlag();
+            ImGui::SetCursorScreenPos(cursor);
+        }
+        at.x = end + px(24.0f);
     }
     // Room for what was drawn, so a window around the hints can fit them.
     ImGui::Dummy({std::max(0.0f, at.x - start.x - px(24.0f)), font()});
