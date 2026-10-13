@@ -555,13 +555,49 @@ void register_display_ctrl(HleRegistrar &hle) {
         kernel().finish(ctx, 0u);
     });
     // The guest flipping the framebuffer is the end of a frame.
+    //
+    // The display reads the framebuffer at the vblank, so setting the buffer
+    // already set, within the same vblank period and with nothing drawn since,
+    // shows nothing new: it is not presented again. A game seen setting it
+    // ten times a frame paid for ten presents, about 10 ms each on MoltenVK,
+    // which the busy clock then made up with a 100 ms hold. <prefix>_PRESENT_EVERY_FLIP presents every call, as
+    // before.
     hle.add("sceDisplay", "sceDisplaySetFrameBuf", [](Runtime &rt, AllegrexContext &ctx) {
-        media().display.framebuffer = arg(ctx, 0);
-        media().display.buffer_width = arg(ctx, 1);
-        media().display.pixel_format = arg(ctx, 2);
+        DisplayState &display = media().display;
+        const bool same_buffer = display.framebuffer == arg(ctx, 0) && display.buffer_width == arg(ctx, 1) &&
+                                 display.pixel_format == arg(ctx, 2);
+        display.framebuffer = arg(ctx, 0);
+        display.buffer_width = arg(ctx, 1);
+        display.pixel_format = arg(ctx, 2);
         trace_pacing("sceDisplaySetFrameBuf");
         stall_watchdog::note_frame();
-        present_frame(rt);
+        static const bool every_flip = portablekit::env("PRESENT_EVERY_FLIP") != nullptr;
+        static std::uint64_t presented_vblank = ~0ull;
+        static std::uint64_t presented_draws = ~0ull;
+        std::uint64_t draws = 0u;
+#if defined(PORTABLEKIT_HAS_RENDERER)
+        if (media().renderer) draws = media().renderer->draws_submitted();
+#endif
+        if (every_flip || !same_buffer || presented_vblank != kernel().vblank_count() || presented_draws != draws) {
+            present_frame(rt);
+            presented_vblank = kernel().vblank_count();
+#if defined(PORTABLEKIT_HAS_RENDERER)
+            presented_draws = media().renderer ? media().renderer->draws_submitted() : 0u;
+#endif
+        }
+        // At most one flip a vblank for a game that asks for it
+        // (GameProfile::flips_wait_for_vblank).
+        static const bool limit = portablekit::game().flips_wait_for_vblank && !portablekit::env_set("FLIP_UNLIMITED");
+        static std::uint64_t flipped_vblank = ~0ull;
+        const std::uint64_t vblank = kernel().vblank_count();
+        const bool again = flipped_vblank == vblank;
+        flipped_vblank = again ? vblank + 1u : vblank;
+        if (limit && again) {
+            WaitState wait{};
+            wait.type = WaitType::VBlank;
+            kernel().block(ctx, wait, 0u);
+            return;
+        }
         kernel().finish(ctx, 0u);
     });
 

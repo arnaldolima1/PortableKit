@@ -263,6 +263,13 @@ struct GameProfile {
     // (Purun). Frame interpolation presents between frames of this length,
     // and the Frame rate setting offers only rates above the game's own.
     std::uint32_t frame_vblanks = 2;
+    // A game that paces its frame loop on nothing but the GE's work (which
+    // takes no emulated time here) flips as fast as the host can draw, many
+    // times a vblank, and then waits all at once when the busy clock catches
+    // up. True makes a second flip within one vblank period wait for the next
+    // vblank, so the game flips at most once a vblank, as it can on a PSP.
+    // <prefix>_FLIP_UNLIMITED turns it off.
+    bool flips_wait_for_vblank = false;
 
     // --- Loading -------------------------------------------------------------
     // Fast loading (kernel/fast_loading.hpp) lets emulated time run ahead
