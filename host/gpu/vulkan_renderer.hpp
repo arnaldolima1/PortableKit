@@ -165,6 +165,14 @@ public:
     void set_frame_rate(settings::FrameRate rate);
     // On, the frame rate steps down by itself rather than slow the game.
     void set_frame_rate_auto(bool automatic);
+    // Frame skipping (settings frame_skip): whether a flip may be skipped now
+    // (not with frame interpolation, which paces presents itself, nor while a
+    // load runs fast), whether a draw into `address` may be dropped in a
+    // skipped frame (a buffer the game shows, or one drawn in the last two
+    // frames: either is redrawn every frame or two), and the flip of a skipped frame, which shows nothing new.
+    [[nodiscard]] bool can_skip_frames() const;
+    [[nodiscard]] bool redrawn_every_frame(std::uint32_t address) const;
+    void skip_flip();
     // The refresh rate of the window's display as SDL reports it, 0 when unknown.
     [[nodiscard]] float display_refresh() const noexcept;
     // The rate frames are presented at now: the setting's, or a slower one

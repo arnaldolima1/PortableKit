@@ -456,6 +456,14 @@ void Menu::video() {
             settings::save();
         }
     }
+    if (choice_row("Frame skip", s.frame_skip ? "Auto" : "Off",
+                   options_for("video.frame_skip",
+                               "Auto: when the game falls behind real time, the next frame is not drawn, so the "
+                               "game keeps its speed and only the picture shows fewer frames (never fewer than half). "
+                               "Off: every frame is drawn, and a slow scene runs slower."))) {
+        s.frame_skip = !s.frame_skip;
+        settings::save();
+    }
     if (choice_row("Game speed", s.unthrottled ? "Unlimited" : "Normal",
                    options_for("video.unthrottled", "Normal holds the game to real time. Unlimited lets it run as "
                                                     "fast as frames can be drawn, which also speeds up the game."))) {

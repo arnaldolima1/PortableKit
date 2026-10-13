@@ -1007,6 +1007,19 @@ void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
     if (count == 0u || vertex_address_ == 0u) return;
 
     const std::uint32_t index_type = (vertex_type_ >> 11u) & 3u;
+    // A skipped frame draws nothing into buffers it redraws every frame: the
+    // pointers move on as the draw would have moved them, with nothing decoded.
+    if (skip_draw_ && skip_draw_(target_.color_address)) {
+        if (index_type != 0u && index_address_ != 0u) {
+            const std::uint32_t index_size = index_type == 1u ? 1u : index_type == 2u ? 2u : 4u;
+            if (memory.contains(index_address_, count * index_size)) index_address_ += count * index_size;
+        } else {
+            const std::uint32_t stride = decode_vertices(memory, vertex_address_, vertex_type_, 0u, call_.vertices);
+            if (stride != 0u && memory.contains(vertex_address_, static_cast<std::size_t>(stride) * count))
+                vertex_address_ += stride * count;
+        }
+        return;
+    }
     // One DrawCall is reused for every draw, so its vertex and index vectors
     // keep their capacity instead of being allocated and freed per draw.
     DrawCall &call = call_;

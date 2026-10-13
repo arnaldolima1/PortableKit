@@ -110,8 +110,28 @@ struct AudioChannel {
     std::uint64_t cursor{};
 };
 
+// Frame skipping keeps the game at full speed when drawing every frame would
+// slow it. Each flip measures what a frame took in real time, drawn or
+// skipped, against the emulated time it stands for (one vblank, or two for a
+// game at 30 frames a second), and skips the share of frames that brings the
+// average within it. The skips are spread evenly, never two in a row, so the
+// picture loses frames steadily instead of the game stuttering and racing to
+// catch up.
+struct FrameSkip {
+    bool skipping{};       // this game frame draws nothing it redraws every frame
+    bool started{};
+    std::chrono::steady_clock::time_point last_real{};
+    std::uint64_t last_virtual_us{};
+    double drawn_ms{};     // average real time of a drawn frame
+    double skipped_ms{};   // of a skipped one
+    double period_ms{};    // average emulated time of a frame
+    double share{};        // of frames to skip, 0 to 0.5
+    double owed{};         // skips due, spread over the frames
+};
+
 struct MediaState {
     DisplayState display;
+    FrameSkip skip;
     std::uint32_t ctrl_cycle{};
     std::uint32_t ctrl_mode{};
     std::map<std::int32_t, GeCallback> ge_callbacks;
@@ -192,6 +212,8 @@ void run_ge_list(Runtime &rt, std::uint32_t id) {
         renderer.begin_display_list();
         media().ge.set_raw_vertices(renderer.gpu_decode(), renderer.check_gpu_decode());
         media().ge.set_draw_sink([&renderer, &memory](const gpu::DrawCall &call) { renderer.submit(call, memory); });
+        if (media().skip.skipping)
+            media().ge.set_skip_draw([&renderer](std::uint32_t address) { return renderer.redrawn_every_frame(address); });
     }
 #endif
     media().ge.set_transfer_sink([&rt](const gpu::BlockTransfer &transfer) { block_transfer(rt, transfer); });
@@ -207,6 +229,7 @@ void run_ge_list(Runtime &rt, std::uint32_t id) {
     }
     list.done = finished;
     media().ge.set_draw_sink(nullptr);
+    media().ge.set_skip_draw(nullptr);
     media().ge.set_transfer_sink(nullptr);
     perf::add_render_time(perf::Clock::now() - start);
 }
@@ -215,6 +238,56 @@ void run_ge_list(Runtime &rt, std::uint32_t id) {
 // The mouse's motion since the previous pump, as degrees for the camera
 // layer. Added after the flip, so whoever drives the camera takes it in the
 // update this frame leads to.
+// At each flip: what the frame took, and whether the next one is skipped.
+// <prefix>_FRAME_SKIP_SHARE=0.5 skips that share of frames whatever they
+// take, to see skipping on a machine that keeps up.
+void decide_frame_skip(gpu::VulkanRenderer &renderer, std::chrono::steady_clock::time_point now) {
+    FrameSkip &f = media().skip;
+    const std::uint64_t virtual_us = kernel().now_us();
+    const bool was_skipped = f.skipping;
+    f.skipping = false;
+    if (!renderer.can_skip_frames()) {
+        f = FrameSkip{};
+        return;
+    }
+    if (!f.started) {
+        f.started = true;
+        f.last_real = now;
+        f.last_virtual_us = virtual_us;
+        return;
+    }
+    const double real_ms = std::chrono::duration<double, std::milli>(now - f.last_real).count();
+    const double virtual_ms = static_cast<double>(virtual_us - f.last_virtual_us) / 1000.0;
+    f.last_real = now;
+    f.last_virtual_us = virtual_us;
+    // A pause, a load or a hitch says nothing about the frames around it.
+    if (real_ms <= 0.0 || real_ms > 100.0 || virtual_ms <= 0.0 || virtual_ms > 100.0) return;
+    const auto average = [](double &value, double sample) { value = value == 0.0 ? sample : value * 0.9 + sample * 0.1; };
+    average(was_skipped ? f.skipped_ms : f.drawn_ms, real_ms);
+    average(f.period_ms, virtual_ms);
+    static const double forced = [] {
+        const char *text = portablekit::env("FRAME_SKIP_SHARE");
+        return text != nullptr ? std::clamp(std::atof(text), 0.0, 0.5) : -1.0;
+    }();
+    if (forced >= 0.0) {
+        f.share = forced;
+    } else {
+        // The share s of skipped frames that makes the average fit the
+        // period: (1 - s) * drawn + s * skipped = period. A skipped frame not
+        // measured yet is taken to cost half a drawn one.
+        const double skipped = f.skipped_ms > 0.0 ? f.skipped_ms : f.drawn_ms * 0.5;
+        const double saving = f.drawn_ms - skipped;
+        // Two percent of slack, so a game that just keeps up is left alone.
+        const double over = f.drawn_ms - f.period_ms * 1.02;
+        f.share = over > 0.0 && saving > 0.0 ? std::clamp(over / saving, 0.0, 0.5) : 0.0;
+    }
+    f.owed = std::min(f.owed + f.share, 1.0);
+    if (!was_skipped && f.owed >= 1.0) {
+        f.owed -= 1.0;
+        f.skipping = true;
+    }
+}
+
 void feed_mouse(gpu::VulkanRenderer &renderer) {
     const settings::Settings &s = settings::current();
     // A drag on the touch screen: Touch camera speed degrees for the screen's
@@ -303,7 +376,10 @@ void present_frame(Runtime &rt) {
     renderer.set_fast_forward(fast_loading::active());
     // The real time the frame stands for, which frame interpolation spaces
     // its presents by: that of the vblank the game's frame started from.
-    const bool presented = renderer.present(address, kernel().real_time_of(frame_start_us(kernel().last_vblank_us())));
+    bool presented = false;
+    if (media().skip.skipping) renderer.skip_flip();
+    else presented = renderer.present(address, kernel().real_time_of(frame_start_us(kernel().last_vblank_us())));
+    decide_frame_skip(renderer, present_start);
     // The frame's camera has been measured by now, so the hunt for the guest
     // variables behind it can compare RAM against it.
     probe::camera_frame(rt, media().ge.view_matrix_source());

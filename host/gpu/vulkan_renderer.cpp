@@ -8039,6 +8039,31 @@ void VulkanRenderer::set_frame_rate(settings::FrameRate rate) {
                               rate == settings::FrameRate::Fps30 ? 0.0 : impl.governor.requested());
 }
 
+bool VulkanRenderer::can_skip_frames() const {
+    return impl_ && impl_->ready && settings::current().frame_skip && !impl_->fast_forward &&
+           !impl_->interpolation_wanted();
+}
+
+bool VulkanRenderer::redrawn_every_frame(std::uint32_t address) const {
+    if (!impl_) return false;
+    // The buffers the game shows are drawn every frame between them: a game
+    // that double-buffers draws each one every other frame. So is anything
+    // drawn in either of the last two frames.
+    if (impl_->shows(address)) return true;
+    const auto found = impl_->targets.find(address);
+    return found != impl_->targets.end() && found->second.initialized &&
+           found->second.last_drawn_frame + 2u >= impl_->frames;
+}
+
+void VulkanRenderer::skip_flip() {
+    if (!impl_ || !impl_->ready) return;
+    // The window keeps the frame shown last: the buffer the game flipped to
+    // holds a picture two frames old. Draws into buffers drawn only now and
+    // then were made, and stay recorded for the next flip.
+    impl_->ui_draw_data = nullptr;
+    perf::count_skipped_frame();
+}
+
 void VulkanRenderer::set_frame_rate_auto(bool automatic) {
     if (!impl_) return;
     impl_->governor.set_automatic(automatic);

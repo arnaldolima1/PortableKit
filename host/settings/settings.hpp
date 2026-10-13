@@ -57,6 +57,7 @@ struct Settings {
     bool fast_loading{true};           // ...but only while the game loads (kernel/fast_loading.hpp)
     FrameRate frame_rate{FrameRate::Fps30};
     bool frame_rate_auto{true};        // lower the frame rate rather than slow the game
+    bool frame_skip{true};             // skip drawing frames rather than slow the game
     PerfDisplay perf{PerfDisplay::Off};
 
     // Text

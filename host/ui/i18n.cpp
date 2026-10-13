@@ -128,6 +128,12 @@ constexpr Entry kPortuguese[] = {
      "up the game.",
      "Normal mantém o jogo em tempo real. Ilimitada deixa rodar tão rápido quanto os quadros puderem ser "
      "desenhados, o que também acelera o jogo."},
+    {"Frame skip", "Pular quadros"},
+    {"Auto: when the game falls behind real time, the next frame is not drawn, so the game keeps its speed and only "
+     "the picture shows fewer frames (never fewer than half). Off: every frame is drawn, and a slow scene runs slower.",
+     "Auto: quando o jogo fica atrás do tempo real, o próximo quadro não é desenhado, então o jogo mantém a "
+     "velocidade e só a imagem mostra menos quadros (nunca menos da metade). Desligado: todo quadro é desenhado, e "
+     "uma cena pesada fica mais lenta."},
     {"Fast loading", "Carregamento rápido"},
     {"Lets the game run ahead of real time while it loads and is silent, so loads take as long as the computer "
      "needs. Never during play, sound, movies or ad hoc play.",

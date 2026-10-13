@@ -242,6 +242,10 @@ public:
     using TransferSink = std::function<void(const BlockTransfer &)>;
 
     void set_draw_sink(DrawSink sink) { draw_sink_ = std::move(sink); }
+    // Frame skipping: asked with a draw's colour buffer before its vertices
+    // are decoded; true drops the draw (the pointers still advance past it).
+    using SkipDraw = std::function<bool(std::uint32_t color_address)>;
+    void set_skip_draw(SkipDraw skip) { skip_draw_ = std::move(skip); }
     void set_signal_sink(SignalSink sink) { signal_sink_ = std::move(sink); }
     // Block transfers are carried out by the sink, which can write guest memory.
     void set_transfer_sink(TransferSink sink) { transfer_sink_ = std::move(sink); }
@@ -324,6 +328,7 @@ private:
     std::vector<std::uint32_t> call_stack_;
     DrawCall call_;  // reused by draw_primitive for every draw
     DrawSink draw_sink_;
+    SkipDraw skip_draw_;
     SignalSink signal_sink_;
     TransferSink transfer_sink_;
     std::uint64_t draw_count_{};
