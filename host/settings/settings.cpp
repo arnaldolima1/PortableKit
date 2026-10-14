@@ -201,6 +201,10 @@ const std::vector<Field> &fields() {
              return true;
          },
          [](const Settings &s) { return s.texture_pack_folder; }, nullptr},
+        {"video.half_rate", "HALF_RATE",
+         [](Settings &s, const std::string &t) { return parse_bool(t, s.half_rate); },
+         [](const Settings &s) { return std::string(s.half_rate ? "1" : "0"); },
+         [](Settings &s, const char *t) { s.half_rate = variable_flag(t); }},
         {"video.unthrottled", "UNTHROTTLED",
          [](Settings &s, const std::string &t) { return parse_bool(t, s.unthrottled); },
          [](const Settings &s) { return std::string(s.unthrottled ? "1" : "0"); },

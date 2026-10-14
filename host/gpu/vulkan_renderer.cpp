@@ -7601,7 +7601,9 @@ double VulkanRenderer::Impl::wanted_rate() const {
 bool VulkanRenderer::Impl::interpolation_wanted() const {
     // Emulated time running ahead of real time already presents faster than
     // the game's own rate; the keyboard's held frame is shown as it is.
-    return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled && !holding && !fast_forward &&
+    // Limit to 30 fps shows the game's frames as they are drawn, every other one.
+    return frame_rate != settings::FrameRate::Fps30 && !settings::current().unthrottled &&
+           !settings::current().half_rate && !holding && !fast_forward &&
            governor.rate() > pacing::game_rate() + 0.5;
 }
 
@@ -8586,8 +8588,10 @@ void VulkanRenderer::set_frame_rate(settings::FrameRate rate) {
 }
 
 bool VulkanRenderer::can_skip_frames() const {
-    return impl_ && impl_->ready && settings::current().frame_skip && !impl_->fast_forward &&
-           !impl_->interpolation_wanted();
+    // Limit to 30 fps skips every other frame whatever Frame skip says.
+    const settings::Settings &s = settings::current();
+    return impl_ && impl_->ready && (s.frame_skip || s.half_rate) && !impl_->fast_forward &&
+           (s.half_rate || !impl_->interpolation_wanted());
 }
 
 bool VulkanRenderer::redrawn_every_frame(std::uint32_t address) const {

@@ -271,6 +271,11 @@ void decide_frame_skip(gpu::VulkanRenderer &renderer, std::chrono::steady_clock:
     }();
     if (forced >= 0.0) {
         f.share = forced;
+    } else if (settings::current().half_rate) {
+        // Limit to 30 fps: every other frame while the game makes 60, as a
+        // game made for 30 draws; none while it makes 30 itself (its movies
+        // and menus), which would leave 15.
+        f.share = f.period_ms < 25.0 ? 0.5 : 0.0;
     } else {
         // The share s of skipped frames that makes the average fit the
         // period: (1 - s) * drawn + s * skipped = period. A skipped frame not

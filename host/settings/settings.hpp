@@ -58,6 +58,7 @@ struct Settings {
     FrameRate frame_rate{FrameRate::Fps30};
     bool frame_rate_auto{true};        // lower the frame rate rather than slow the game
     bool frame_skip{true};             // skip drawing frames rather than slow the game
+    bool half_rate{};                  // a 60 fps game drawn every other frame: 30 on screen, full speed
     PerfDisplay perf{PerfDisplay::Off};
 
     // Text

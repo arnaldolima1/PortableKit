@@ -417,6 +417,10 @@ void Menu::video() {
             o.disabled = true;
             o.note = "Game speed is Unlimited";
         }
+        if (s.half_rate && !o.disabled) {
+            o.disabled = true;
+            o.note = "Limit to 30 fps is on";
+        }
         const int current = static_cast<int>(s.frame_rate);
         std::string value = kRates[current];
         if (s.frame_rate == settings::FrameRate::Display && renderer().display_refresh() > 0.0f)
@@ -456,13 +460,30 @@ void Menu::video() {
             settings::save();
         }
     }
-    if (choice_row("Frame skip", s.frame_skip ? "Auto" : "Off",
-                   options_for("video.frame_skip",
-                               "Auto: when the game falls behind real time, the next frame is not drawn, so the "
-                               "game keeps its speed and only the picture shows fewer frames (never fewer than half). "
-                               "Off: every frame is drawn, and a slow scene runs slower."))) {
-        s.frame_skip = !s.frame_skip;
-        settings::save();
+    // Only for a game that draws 60 frames a second: one made for 30 is
+    // there already.
+    if (gpu::pacing::game_rate() > 50.0) {
+        if (choice_row("Limit to 30 fps", s.half_rate ? "On" : "Off",
+                       options_for("video.half_rate",
+                                   "Draws every other frame: the game keeps its full speed and the picture shows 30 "
+                                   "frames a second, with half the drawing work. For devices that cannot hold 60."))) {
+            s.half_rate = !s.half_rate;
+            settings::save();
+        }
+    }
+    {
+        RowOptions o = options_for("video.frame_skip",
+                                   "Auto: when the game falls behind real time, the next frame is not drawn, so the "
+                                   "game keeps its speed and only the picture shows fewer frames (never fewer than "
+                                   "half). Off: every frame is drawn, and a slow scene runs slower.");
+        if (s.half_rate && !o.disabled) {
+            o.disabled = true;
+            o.note = "Limit to 30 fps is on";
+        }
+        if (choice_row("Frame skip", s.frame_skip ? "Auto" : "Off", o)) {
+            s.frame_skip = !s.frame_skip;
+            settings::save();
+        }
     }
     if (choice_row("Game speed", s.unthrottled ? "Unlimited" : "Normal",
                    options_for("video.unthrottled", "Normal holds the game to real time. Unlimited lets it run as "
@@ -514,6 +535,7 @@ void Menu::video() {
         restore("video.frame_rate", s.frame_rate, d.frame_rate);
         restore("video.frame_rate_auto", s.frame_rate_auto, d.frame_rate_auto);
         restore("video.unthrottled", s.unthrottled, d.unthrottled);
+        restore("video.half_rate", s.half_rate, d.half_rate);
         restore("video.fast_loading", s.fast_loading, d.fast_loading);
         restore("video.performance", s.perf, d.perf);
         renderer().set_internal_scale(s.internal_scale);
