@@ -211,7 +211,7 @@ void run_ge_list(Runtime &rt, std::uint32_t id) {
         const psprecomp::GuestMemory &memory = rt.memory();
         renderer.begin_display_list();
         media().ge.set_raw_vertices(renderer.gpu_decode(), renderer.check_gpu_decode());
-        media().ge.set_draw_sink([&renderer, &memory](const gpu::DrawCall &call) { renderer.submit(call, memory); });
+        media().ge.set_draw_sink([&renderer, &memory](gpu::DrawCall &call) { renderer.submit(call, memory); });
         if (media().skip.skipping)
             media().ge.set_skip_draw([&renderer](std::uint32_t address) { return renderer.redrawn_every_frame(address); });
     }

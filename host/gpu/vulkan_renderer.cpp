@@ -25,6 +25,9 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#if defined(__ANDROID__) || defined(__linux__)
+#include <sched.h>
+#endif
 #include <vulkan/vulkan.h>
 
 #include "backends/imgui_impl_vulkan.h"
@@ -590,6 +593,9 @@ void read_gamepad(SDL_Gamepad *device, PadState &pad, int &analog_x, int &analog
 struct RenderJob {
     virtual ~RenderJob() = default;
     virtual void run() = 0;
+    // A job that went back to a pool of its own when it ran: the queue lets
+    // go of it rather than delete it.
+    [[nodiscard]] virtual bool pooled() const { return false; }
 };
 
 template <typename Function>
@@ -2285,6 +2291,11 @@ struct VulkanRenderer::Impl {
         std::condition_variable wake;  // work, or stop
         std::condition_variable idle;  // nothing left to do
         std::deque<std::unique_ptr<RenderJob>> jobs;
+        // Frames handed over and not yet presented. The game's thread waits
+        // at its flip while more than one is: work handed over faster than
+        // the thread records it would pile up without bound.
+        int frames_queued{};
+        std::condition_variable frame_done;
         bool waiting{};  // the thread sleeps on `wake`
         bool busy{};     // the thread runs jobs it has taken
         bool stop{};
@@ -2342,6 +2353,60 @@ struct VulkanRenderer::GuestDraw {
     Impl::TextureRequest texture;
 };
 
+// A draw handed to the render thread: the job that draws it, back in the
+// renderer's pool afterwards with its buffers, for the next draw.
+struct PreparedDraw final : RenderJob {
+    VulkanRenderer *renderer{};
+    DrawCall call;
+    VulkanRenderer::GuestDraw guest;
+    // A raw draw's guest bytes and bone matrices, which `call` points into
+    // guest memory for (GPU vertex decode).
+    std::vector<std::uint8_t> raw;
+    std::array<float, 96> bones{};
+    void run() override;
+    [[nodiscard]] bool pooled() const override { return true; }
+};
+
+// Draws move between the threads in batches, so neither takes the lock at
+// every draw: the render thread gathers the ones it drew, the game's thread
+// takes them all when it runs out.
+struct VulkanRenderer::DrawPool {
+    std::mutex mutex;
+    std::vector<PreparedDraw *> free;        // under the lock
+    std::vector<PreparedDraw *> game_free;   // the game's thread's
+    std::vector<PreparedDraw *> drawn;       // the render thread's
+    DrawPool() = default;
+    DrawPool(const DrawPool &) = delete;
+    DrawPool &operator=(const DrawPool &) = delete;
+    ~DrawPool() {
+        for (auto *list : {&free, &game_free, &drawn})
+            for (PreparedDraw *draw : *list) delete draw;
+    }
+    PreparedDraw *take() {
+        if (game_free.empty()) {
+            const std::lock_guard guard(mutex);
+            game_free.swap(free);
+        }
+        if (game_free.empty()) return new PreparedDraw();
+        PreparedDraw *draw = game_free.back();
+        game_free.pop_back();
+        return draw;
+    }
+    void give_back(PreparedDraw *draw) {
+        drawn.push_back(draw);
+        if (drawn.size() < 32u) return;
+        const std::lock_guard guard(mutex);
+        free.insert(free.end(), drawn.begin(), drawn.end());
+        drawn.clear();
+    }
+};
+
+void PreparedDraw::run() {
+    renderer->draw(call, guest, nullptr);
+    guest.texture = {};  // the bytes and the pack image are not kept
+    renderer->draw_pool_->give_back(this);
+}
+
 void VulkanRenderer::Impl::start_render_thread() {
     if (render.thread.joinable()) return;
     render.stop = false;
@@ -2362,8 +2427,44 @@ void VulkanRenderer::Impl::stop_render_thread() {
     threaded = false;
 }
 
+#if defined(__ANDROID__) || defined(__linux__)
+namespace {
+// Keeps the calling thread on the fastest cores. A phone pairs two or so fast
+// cores with slow ones, and the scheduler started the render thread on a
+// slow core (a Cortex-A55 on a Snapdragon 695), where recording took twice
+// what the game thread had taken for it. <prefix>_RENDER_THREAD_ANY_CORE
+// leaves the scheduler to choose.
+void prefer_fast_cores() {
+    if (portablekit::env("RENDER_THREAD_ANY_CORE") != nullptr) return;
+    std::vector<std::pair<int, long>> cores;
+    for (int cpu = 0; cpu < 64; ++cpu) {
+        std::ifstream in("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq/cpuinfo_max_freq");
+        long khz = 0;
+        if (in >> khz) cores.emplace_back(cpu, khz);
+    }
+    long fastest = 0;
+    for (const auto &[cpu, khz] : cores) fastest = std::max(fastest, khz);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int count = 0;
+    for (const auto &[cpu, khz] : cores) {
+        if (khz != fastest) continue;
+        CPU_SET(cpu, &set);
+        ++count;
+    }
+    // All cores alike, or one fast core the game's thread needs: no say.
+    if (count == 0 || count == static_cast<int>(cores.size()) || count < 2) return;
+    if (sched_setaffinity(0, sizeof(set), &set) == 0)
+        std::cout << "[render] render thread kept on the " << count << " fastest cores" << std::endl;
+}
+} // namespace
+#endif
+
 void VulkanRenderer::Impl::render_main() {
     perf::mark_render_thread();
+#if defined(__ANDROID__) || defined(__linux__)
+    prefer_fast_cores();
+#endif
     std::deque<std::unique_ptr<RenderJob>> batch;
     std::unique_lock lock(render.mutex);
     for (;;) {
@@ -2375,7 +2476,10 @@ void VulkanRenderer::Impl::render_main() {
         render.busy = true;
         lock.unlock();
         const perf::Clock::time_point start = perf::Clock::now();
-        for (std::unique_ptr<RenderJob> &job : batch) job->run();
+        for (std::unique_ptr<RenderJob> &job : batch) {
+            job->run();
+            if (job->pooled()) static_cast<void>(job.release());
+        }
         batch.clear();
         perf::add_render_thread_time(perf::Clock::now() - start);
         lock.lock();
@@ -2406,7 +2510,11 @@ void VulkanRenderer::Impl::sync() {
     if (!render.thread.joinable() || std::this_thread::get_id() == render.thread.get_id()) return;
     flush_jobs();
     std::unique_lock lock(render.mutex);
+    if (render.jobs.empty() && !render.busy) return;
+    const perf::Clock::time_point start = perf::Clock::now();
     render.idle.wait(lock, [this] { return render.jobs.empty() && !render.busy; });
+    lock.unlock();
+    perf::add_wait_time(perf::Clock::now() - start, perf::Stall::Sync);
 }
 
 void VulkanRenderer::Impl::compare_gpu_decode(std::uint32_t from) {
@@ -2503,7 +2611,7 @@ void VulkanRenderer::Impl::collect_gpu_time(std::uint32_t from) {
     if (any) perf::add_gpu_time(static_cast<double>(ticks) * gpu_timer_ns_per_tick / 1.0e6);
 }
 
-VulkanRenderer::VulkanRenderer() : impl_(std::make_unique<Impl>()) {}
+VulkanRenderer::VulkanRenderer() : impl_(std::make_unique<Impl>()), draw_pool_(std::make_unique<DrawPool>()) {}
 VulkanRenderer::~VulkanRenderer() { shutdown(); }
 
 bool VulkanRenderer::available() const noexcept { return impl_ && impl_->ready; }
@@ -6786,8 +6894,7 @@ void VulkanRenderer::upload_frame_now(std::uint32_t display_address, const std::
 }
 
 bool VulkanRenderer::gpu_decode() const {
-    // A raw draw points into guest memory, which the render thread cannot read.
-    if (!impl_ || !impl_->ready || !impl_->gpu_decode_available || impl_->thread_enabled) return false;
+    if (!impl_ || !impl_->ready || !impl_->gpu_decode_available) return false;
     // Off unless <prefix>_GPU_DECODE=1 asks for it: on the Steam Deck (radv)
     // the raw vertex path hung the GPU (ring gfx timeout) at the character
     // select screen, and the CPU decode did not. Also off for the paths and
@@ -6823,7 +6930,12 @@ void VulkanRenderer::begin_display_list() {
 // A draw, in two halves: what needs guest memory, here on the thread that runs
 // the game's display lists, and the rest in draw(), which records it and may
 // run later on the render thread.
-void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
+void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) { submit_draw(call, nullptr, memory); }
+
+void VulkanRenderer::submit(DrawCall &call, const GuestMemory &memory) { submit_draw(call, &call, memory); }
+
+// `take`, when given, is `call`, whose vertex and index buffers may be taken.
+void VulkanRenderer::submit_draw(const DrawCall &call, DrawCall *take, const GuestMemory &memory) {
     Impl &impl = *impl_;
     if (!impl.ready) return;
     const perf::SplitScope split(perf::Split::Draw);
@@ -6878,7 +6990,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         moved.viewport.scissor_x2 += alias->x;
         moved.viewport.scissor_y1 += alias->y;
         moved.viewport.scissor_y2 += alias->y;
-        submit(moved, memory);
+        submit_draw(moved, &moved, memory);
         return;
     }
 
@@ -6894,16 +7006,30 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         draw(call, guest, &memory);
         return;
     }
-    // The render thread draws a copy: GeState reuses its call for the next
-    // draw, and the texture's bytes go with it.
+    // The render thread draws its own copy, as GeState reuses its call for
+    // the next draw; the texture's bytes go with it.
     if (call.texture.enabled && !call.clear_mode && !guest.framebuffer.found())
         impl.prepare_texture(memory, call, guest.texture);
-    struct Prepared {
-        DrawCall call;
-        GuestDraw guest;
-    };
-    auto prepared = std::make_unique<Prepared>(Prepared{call, std::move(guest)});
-    impl.enqueue(make_job([this, prepared = std::move(prepared)] { draw(prepared->call, prepared->guest, nullptr); }));
+    PreparedDraw *prepared = draw_pool_->take();
+    prepared->renderer = this;
+    // Copied into the pooled draw's own buffers, which keep their size from
+    // one use to the next. Swapping buffers with GeState instead made it
+    // decode into smaller ones and grow them again, twice the decoding time.
+    static_cast<void>(take);
+    prepared->call = call;
+    if (call.raw_vertices != nullptr) {
+        // GPU vertex decode: the guest's vertex bytes, smaller than decoded
+        // vertices and not decoded here at all.
+        prepared->raw.assign(call.raw_vertices,
+                             call.raw_vertices + static_cast<std::size_t>(call.raw_count) * call.raw_stride);
+        prepared->call.raw_vertices = prepared->raw.data();
+        if (call.bone_matrices != nullptr) {
+            std::copy_n(call.bone_matrices, prepared->bones.size(), prepared->bones.begin());
+            prepared->call.bone_matrices = prepared->bones.data();
+        }
+    }
+    prepared->guest = std::move(guest);
+    impl.enqueue(std::unique_ptr<RenderJob>(prepared));
 }
 
 void VulkanRenderer::draw(const DrawCall &call, const GuestDraw &guest, const GuestMemory *memory) {
@@ -8903,8 +9029,28 @@ bool VulkanRenderer::present(std::uint32_t display_address,
     }
     bool presented = true;
     if (impl.threaded) {
-        impl.enqueue(make_job([this, display_address, moment] { present_frame(display_address, moment); }));
+        {
+            const std::lock_guard guard(impl.render.mutex);
+            ++impl.render.frames_queued;
+        }
+        impl.enqueue(make_job([this, &impl, display_address, moment] {
+            present_frame(display_address, moment);
+            {
+                const std::lock_guard guard(impl.render.mutex);
+                --impl.render.frames_queued;
+            }
+            impl.render.frame_done.notify_all();
+        }));
         impl.flush_jobs();
+        {
+            std::unique_lock lock(impl.render.mutex);
+            if (impl.render.frames_queued > 1) {
+                const perf::Clock::time_point start = perf::Clock::now();
+                impl.render.frame_done.wait(lock, [&impl] { return impl.render.frames_queued <= 1; });
+                lock.unlock();
+                perf::add_wait_time(perf::Clock::now() - start, perf::Stall::Sync);
+            }
+        }
         // Only a load running fast leaves a flip unshown with the thread on.
         presented = !impl.guest_fast_forward;
     } else {
@@ -9005,10 +9151,12 @@ bool VulkanRenderer::present_frame(std::uint32_t display_address,
     // The shown frame is copied back into guest VRAM for a game that reads it
     // with the CPU. A game that never does says so in its profile, and saves
     // the copy and its conversion every frame. <prefix>_NO_FRAME_WRITEBACK
-    // turns it off for any game, to find out.
+    // turns it off for any game, to find out; <prefix>_FRAME_WRITEBACK=1 turns
+    // it on for a game whose profile has it off.
     static const bool no_writeback = portablekit::env("NO_FB_TEXTURES") != nullptr ||
                                      portablekit::env("NO_FRAME_WRITEBACK") != nullptr ||
-                                     !portablekit::game().frame_writeback;
+                                     (!portablekit::game().frame_writeback &&
+                                      portablekit::env("FRAME_WRITEBACK") == nullptr);
     if (!no_writeback) impl.record_writeback(display_address);
 
     // Show the target the guest flipped to; fall back to whatever was drawn last.

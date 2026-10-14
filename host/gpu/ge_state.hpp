@@ -255,7 +255,9 @@ struct BlockTransfer {
 // installs a sink; with no sink the lists are still parsed (for callbacks).
 class GeState {
 public:
-    using DrawSink = std::function<void(const DrawCall &)>;
+    // The draw may be taken apart: GeState clears it before the next one, so
+    // a sink may swap its vertex and index buffers for others.
+    using DrawSink = std::function<void(DrawCall &)>;
     using SignalSink = std::function<void(std::uint32_t signal, std::uint32_t pc)>;
     using TransferSink = std::function<void(const BlockTransfer &)>;
 

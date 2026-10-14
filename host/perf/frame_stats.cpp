@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +27,22 @@ std::mutex &lock() {
     return value;
 }
 thread_local bool tls_render_thread = false;
+
+// Counts made at every draw, from both threads: atomics rather than the lock,
+// which the two threads fought over at every draw. end_frame() takes them.
+struct Counters {
+    std::atomic<std::uint32_t> lists{};
+    std::atomic<std::uint32_t> draws{};
+    std::atomic<std::uint32_t> recorded_draws{};
+    std::atomic<std::uint64_t> passes{};
+    std::atomic<std::uint64_t> copies{};
+    std::atomic<std::uint64_t> skipped{};
+    std::atomic<std::uint64_t> cleared_passes{};
+};
+Counters &counters() {
+    static Counters value;
+    return value;
+}
 
 double to_ms(Clock::duration duration) {
     return std::chrono::duration<double, std::milli>(duration).count();
@@ -243,6 +260,7 @@ const char *stall_name(Stall kind) {
     case Stall::Store: return "store";
     case Stall::Pipeline: return "pipeline";
     case Stall::Decode: return "decode";
+    case Stall::Sync: return "sync";
     case Stall::Count: break;
     }
     return "?";
@@ -262,6 +280,11 @@ Options options() {
 void restart_measurement() {
     const std::lock_guard guard(lock());
     State &s = state();
+    Counters &c = counters();
+    c.lists = 0u;
+    c.draws = 0u;
+    c.recorded_draws = 0u;
+    c.passes = c.copies = c.skipped = c.cleared_passes = 0u;
     const Clock::time_point now = Clock::now();
     s.frame_start = now;
     s.last_present = now;
@@ -406,34 +429,15 @@ void add_overlay_time(Clock::duration duration) {
     const std::lock_guard guard(lock());
     state().overlay += duration;
 }
-void count_display_list() {
-    const std::lock_guard guard(lock());
-    ++state().lists;
-}
-void count_draw() {
-    const std::lock_guard guard(lock());
-    ++state().draws;
-}
+void count_display_list() { counters().lists.fetch_add(1u, std::memory_order_relaxed); }
+void count_draw() { counters().draws.fetch_add(1u, std::memory_order_relaxed); }
 void count_recorded_draws(std::uint32_t count) {
-    const std::lock_guard guard(lock());
-    state().recorded_draws += count;
+    counters().recorded_draws.fetch_add(count, std::memory_order_relaxed);
 }
-void count_render_pass() {
-    const std::lock_guard guard(lock());
-    ++state().pass_sum;
-}
-void count_target_copy() {
-    const std::lock_guard guard(lock());
-    ++state().copy_sum;
-}
-void count_skipped_frame() {
-    const std::lock_guard guard(lock());
-    ++state().skipped_sum;
-}
-void count_cleared_pass() {
-    const std::lock_guard guard(lock());
-    ++state().cleared_pass_sum;
-}
+void count_render_pass() { counters().passes.fetch_add(1u, std::memory_order_relaxed); }
+void count_target_copy() { counters().copies.fetch_add(1u, std::memory_order_relaxed); }
+void count_skipped_frame() { counters().skipped.fetch_add(1u, std::memory_order_relaxed); }
+void count_cleared_pass() { counters().cleared_passes.fetch_add(1u, std::memory_order_relaxed); }
 
 void note_frame_space(std::uint64_t vertex_bytes, std::uint64_t index_bytes) {
     const std::lock_guard guard(lock());
@@ -481,6 +485,16 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
     const std::lock_guard guard(lock());
     State &s = state();
     if (presented) count_present_locked();
+    {
+        Counters &c = counters();
+        s.lists += c.lists.exchange(0u, std::memory_order_relaxed);
+        s.draws += c.draws.exchange(0u, std::memory_order_relaxed);
+        s.recorded_draws += c.recorded_draws.exchange(0u, std::memory_order_relaxed);
+        s.pass_sum += c.passes.exchange(0u, std::memory_order_relaxed);
+        s.copy_sum += c.copies.exchange(0u, std::memory_order_relaxed);
+        s.skipped_sum += c.skipped.exchange(0u, std::memory_order_relaxed);
+        s.cleared_pass_sum += c.cleared_passes.exchange(0u, std::memory_order_relaxed);
+    }
     const Clock::time_point now = Clock::now();
     const double frame_ms = to_ms(now - s.frame_start);
     s.frame_start_previous = s.frame_start;

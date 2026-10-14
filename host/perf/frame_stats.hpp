@@ -57,6 +57,7 @@ enum class Stall : std::uint8_t {
     Store,     // converting that frame into guest memory (store_frame)
     Pipeline,  // creating a graphics pipeline the frame needs (CPU work inside "render")
     Decode,    // waiting at the frame's submit for textures decoded in the background
+    Sync,      // the game's thread waiting for the render thread to catch up
     Count,
 };
 [[nodiscard]] const char *stall_name(Stall kind);

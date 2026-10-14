@@ -128,6 +128,9 @@ public:
     [[nodiscard]] bool gpu_decode() const;
     [[nodiscard]] bool check_gpu_decode() const;
     void submit(const DrawCall &call, const GuestMemory &memory);
+    // The same, free to take the call's vertex and index buffers (leaving
+    // others in their place) rather than copy them for the render thread.
+    void submit(DrawCall &call, const GuestMemory &memory);
     // Writes the framebuffer shown a frame or two ago back to guest VRAM, in
     // the guest's pixel format at 480x272, so game code that copies a frame
     // out of VRAM with the CPU or DMA finds the picture instead of stale
@@ -291,6 +294,11 @@ private:
     // that runs the display lists; draw() does the rest.
     struct GuestDraw;
     void draw(const DrawCall &call, const GuestDraw &guest, const GuestMemory *memory);
+    void submit_draw(const DrawCall &call, DrawCall *take, const GuestMemory &memory);
+    // Draws handed to the render thread, kept for reuse with their buffers.
+    struct DrawPool;
+    std::unique_ptr<DrawPool> draw_pool_;
+    friend struct PreparedDraw;
     // present() and upload_frame() on the thread that records.
     bool present_frame(std::uint32_t display_address, std::optional<std::chrono::steady_clock::time_point> moment);
     void upload_frame_now(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
