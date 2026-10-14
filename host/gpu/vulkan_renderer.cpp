@@ -586,6 +586,51 @@ void read_gamepad(SDL_Gamepad *device, PadState &pad, int &analog_x, int &analog
 // texture first drawn while a frame is recorded is copied out of guest
 // memory, decoded on these threads while the frame goes on, and uploaded
 // ahead of the frame's commands when the frame is submitted.
+// A piece of work handed to the render thread (Impl::enqueue()).
+struct RenderJob {
+    virtual ~RenderJob() = default;
+    virtual void run() = 0;
+};
+
+template <typename Function>
+struct FunctionJob final : RenderJob {
+    explicit FunctionJob(Function function) : function_(std::move(function)) {}
+    void run() override { function_(); }
+    Function function_;
+};
+
+template <typename Function>
+std::unique_ptr<RenderJob> make_job(Function &&function) {
+    return std::make_unique<FunctionJob<std::decay_t<Function>>>(std::forward<Function>(function));
+}
+
+// The interface's draw lists copied out of ImGui, which builds the next frame
+// meanwhile, for the render thread to draw.
+struct ClonedDrawData {
+    ImDrawData data;
+    std::vector<ImDrawList *> lists;
+    ClonedDrawData() = default;
+    ClonedDrawData(const ClonedDrawData &) = delete;
+    ClonedDrawData &operator=(const ClonedDrawData &) = delete;
+    ~ClonedDrawData() {
+        for (ImDrawList *list : lists) IM_DELETE(list);
+    }
+};
+
+std::unique_ptr<ClonedDrawData> clone_draw_data(const ImDrawData &source) {
+    auto clone = std::make_unique<ClonedDrawData>();
+    clone->data = source;
+    clone->data.CmdLists.resize(0);
+    for (ImDrawList *list : source.CmdLists) {
+        ImDrawList *copy = list->CloneOutput();
+        clone->lists.push_back(copy);
+        clone->data.CmdLists.push_back(copy);
+    }
+    // Texture updates are made before the copy (set_ui_draw_data()).
+    clone->data.Textures = nullptr;
+    return clone;
+}
+
 struct DecodeJob {
     TextureSnapshot snapshot;
     std::vector<std::uint32_t> pixels;
@@ -843,10 +888,10 @@ struct VulkanRenderer::Impl {
     std::uint32_t swapchain_min_images{2u};
     // Set by a resize, a present mode change or an out-of-date swapchain;
     // the swapchain is rebuilt before the next acquire.
-    bool swapchain_dirty{};
+    std::atomic<bool> swapchain_dirty{};
     // Set when the swapchain may no longer suit the surface (a suboptimal
     // present, a turned display); see check_swapchain().
-    bool swapchain_check{};
+    std::atomic<bool> swapchain_check{};
 
     // Display settings.
     settings::PresentMode requested_present{settings::PresentMode::Fifo};
@@ -856,7 +901,7 @@ struct VulkanRenderer::Impl {
     // kSettleFrames frames; a changed setting applies at the next chance.
     VkExtent2D pending_extent{};
     std::uint32_t pending_frames{};
-    bool resize_now{};
+    std::atomic<bool> resize_now{};
     // The framebuffers the game showed last: its interface is drawn into them.
     std::array<std::uint32_t, 2> display_addresses{};
     bool sharp_screen{};
@@ -1066,7 +1111,7 @@ struct VulkanRenderer::Impl {
     // Performance overlay: drawn on the CPU, copied through a mapped staging
     // buffer into a small image and scaled onto the swapchain image after the
     // game frame, so screenshots of the window include it.
-    bool overlay_visible{};
+    std::atomic<bool> overlay_visible{};
     bool overlay_ready{};
     VkImage overlay_image{};
     VkDeviceMemory overlay_memory{};
@@ -1107,24 +1152,9 @@ struct VulkanRenderer::Impl {
         // in pixels and pixel format (0:5650 1:5551 2:4444 3:8888).
         std::uint32_t stride{512u};
         std::uint32_t format{3u};
-        std::uint64_t last_drawn_frame{};
         // Bumped by every draw into the target, so a copy made for sampling
         // knows when it is out of date.
         std::uint64_t draw_serial{};
-        // One guest word from every 256 bytes of the buffer, read when it was
-        // last drawn to. The renderer never writes guest memory, so a word that
-        // has changed since means the game put something else there.
-        std::vector<std::uint32_t> guest_words;
-        std::uint64_t snapshot_serial{};  // bumped by every new snapshot
-        // Ranges of guest memory compared word by word against this snapshot
-        // in frame `checked_frame`. A bloom chain samples the same buffer some
-        // thirty times a frame, and on a phone comparing every word each time
-        // cost milliseconds of cache misses: a range compared once in a frame
-        // is spot-checked after that, which still sees a texture written over
-        // the buffer (it changes nearly every word).
-        std::uint64_t checked_frame{~0ull};
-        std::uint64_t checked_snapshot{};
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> checked;
         // The copy that draws sample when the game textures from this buffer:
         // a render pass cannot read its own attachment.
         VkImage copy{};
@@ -1156,6 +1186,45 @@ struct VulkanRenderer::Impl {
         bool stencil_used{};
     };
     std::map<std::uint32_t, Target> targets;
+
+    // What guest memory says about the targets, kept on the thread that runs
+    // the game's display lists (the render thread, render_thread below, never
+    // touches it): which addresses the game has drawn, as which layout, and
+    // whether a texture read from one still matches what was drawn. With
+    // these, a draw is prepared on the game's thread while earlier draws are
+    // still being recorded.
+    struct GuestTarget {
+        // As the game last drew into it.
+        std::uint32_t stride{512u};
+        std::uint32_t format{3u};
+        std::uint64_t last_drawn_frame{};
+        // One guest word from every 256 bytes of the buffer, read when it was
+        // last drawn to. The renderer never writes guest memory, so a word that
+        // has changed since means the game put something else there.
+        std::vector<std::uint32_t> guest_words;
+        std::uint64_t snapshot_serial{};  // bumped by every new snapshot
+        // Ranges of guest memory compared word by word against this snapshot
+        // in frame `checked_frame`. A bloom chain samples the same buffer some
+        // thirty times a frame, and on a phone comparing every word each time
+        // cost milliseconds of cache misses: a range compared once in a frame
+        // is spot-checked after that, which still sees a texture written over
+        // the buffer (it changes nearly every word).
+        std::uint64_t checked_frame{~0ull};
+        std::uint64_t checked_snapshot{};
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> checked;
+        std::uint64_t draw_serial{};  // which of two targets was drawn last
+    };
+    std::map<std::uint32_t, GuestTarget> guest_targets;
+    std::uint64_t guest_frames{};        // flips presented, counted on the game's thread
+    std::uint64_t guest_draw_counter{};
+    std::array<std::uint32_t, 2> guest_display{};  // the last two addresses flipped to
+    [[nodiscard]] bool guest_shows(std::uint32_t address) const {
+        return address != 0u && (address == guest_display[0] || address == guest_display[1]);
+    }
+    // A draw into `address`: the target's layout and, at its first draw of a
+    // frame or a new layout, its words.
+    void note_guest_draw(const GuestMemory &memory, const RenderTarget &drawn);
+
     // Write-back of the displayed framebuffer to guest VRAM (write_back_frame):
     // present() scales the target to 480x272 and copies it into a mapped
     // buffer; begin_frame(), after the frame fence, takes the pixels; the next
@@ -1673,7 +1742,7 @@ struct VulkanRenderer::Impl {
     // A swapchain image acquired before recording a present between flips,
     // for submit_and_present to present.
     std::optional<std::uint32_t> acquired_image;
-    float display_hz{};
+    std::atomic<float> display_hz{};
     // The newest texture_clock value a destroyed texture had been drawn with:
     // a recorded frame that began before it may name its descriptor.
     std::uint64_t destroyed_texture_clock{};
@@ -1704,7 +1773,7 @@ struct VulkanRenderer::Impl {
     // HD texture pack (texture_pack.hpp). `pack` is null while the setting
     // is off or no pack is installed; turning the setting on or off takes
     // effect at the next begin_frame().
-    std::unique_ptr<TexturePack> pack;
+    std::shared_ptr<TexturePack> pack;
     std::unique_ptr<TextureDumper> dumper;
     ReplacementTextures replacements;
     bool pack_wanted{};
@@ -2014,7 +2083,7 @@ struct VulkanRenderer::Impl {
     // frame. So the swapchain is rebuilt only when the display's transform or
     // the window's size really changed: once per turn of the phone.
     void check_swapchain() {
-        if (!std::exchange(swapchain_check, false) || swapchain == VK_NULL_HANDLE) return;
+        if (!swapchain_check.exchange(false) || swapchain == VK_NULL_HANDLE) return;
 #if defined(__ANDROID__)
         VkSurfaceCapabilitiesKHR capabilities{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities) != VK_SUCCESS) return;
@@ -2082,13 +2151,14 @@ struct VulkanRenderer::Impl {
     // A render target the texture reads, with the texture's first texel as a
     // pixel position inside it; see framebuffer_texture().
     struct FramebufferTexture {
-        Target *target{};
+        std::uint32_t address{};  // of the target; 0: none
         std::uint32_t x{};
         std::uint32_t y{};
+        [[nodiscard]] bool found() const noexcept { return address != 0u; }
     };
     [[nodiscard]] FramebufferTexture find_framebuffer_texture(const GuestMemory &memory,
                                                               const TextureState &texture);
-    // The sampled copy of `source.target`; the texture reads `width` x
+    // The sampled copy of the target at `source.address`; the texture reads `width` x
     // `height` guest pixels of it from (source.x, source.y).
     VkDescriptorSet framebuffer_descriptor(const FramebufferTexture &source, std::uint32_t width,
                                            std::uint32_t height, bool opaque);
@@ -2129,13 +2199,24 @@ struct VulkanRenderer::Impl {
         std::uint64_t drawn_frame{~0ull};  // the frame this address was last drawn at
     };
     std::map<std::uint32_t, TargetAlias> target_aliases;
+    // The last question alias_for() answered; guest_targets_version moves when
+    // a target is added or changes layout, which can change the answer.
+    struct AliasQuery {
+        bool valid{};
+        std::uint32_t address{};
+        std::uint32_t stride{};
+        std::uint32_t format{};
+        std::uint64_t version{};
+        std::optional<TargetAlias> result;
+    } last_alias_query;
+    std::uint64_t guest_targets_version{};
     [[nodiscard]] std::optional<TargetAlias> alias_for(const RenderTarget &target);
     VkDescriptorSet framebuffer_extract(const FramebufferTexture &source, std::uint32_t width, std::uint32_t height,
                                         bool opaque);
     void destroy_extracts();
     // <prefix>_TRACE_PASSES: every render pass and target copy, one line each.
     [[nodiscard]] std::uint32_t target_address(const Target &target) const;
-    void snapshot_guest_words(const GuestMemory &memory, std::uint32_t address, Target &target);
+    void snapshot_guest_words(const GuestMemory &memory, std::uint32_t address, GuestTarget &target);
     Texture create_texture(std::uint32_t width, std::uint32_t height, const std::uint32_t *pixels);
     // The image, view and descriptor of a texture, with no pixels yet.
     Texture create_texture_image(std::uint32_t width, std::uint32_t height);
@@ -2143,7 +2224,190 @@ struct VulkanRenderer::Impl {
     // while one is recorded, else at once (waiting for the queue).
     void upload_texture(VkImage image, std::uint32_t width, std::uint32_t height, const std::uint32_t *pixels);
     void destroy_texture(Texture &texture);
+    // Makes room in `textures` for one more, dropping the least recently used.
+    void make_room_for_texture();
+
+    // --- Textures for a draw prepared on the game's thread -----------------
+    // A draw's texture as prepare_texture() found it in guest memory: its key
+    // and, for one the render thread may not hold, its bytes (or its pixels,
+    // when they could not be copied). texture_descriptor(request) finds or
+    // makes it without reading guest memory.
+    struct TextureRequest {
+        bool wanted{};
+        std::uint64_t key{};
+        std::shared_ptr<DecodeJob> job;
+        std::vector<std::uint32_t> pixels;
+        bool undecodable{};
+        // The texture pack's image, looked up here where guest memory is at
+        // hand: when the texture is new, or a 512-tall one is drawn further
+        // down than before.
+        bool replacement_set{};
+        std::shared_ptr<Replacement> replacement;
+        std::uint16_t max_seen_v{};
+    };
+    void prepare_texture(const GuestMemory &memory, const DrawCall &call, TextureRequest &request);
+    [[nodiscard]] VkDescriptorSet texture_descriptor(const TextureRequest &request, const DrawCall &call);
+    // The game thread's own memo: the keys of this display list's textures,
+    // and the textures it has handed over, which the render thread holds
+    // until it reports them dropped.
+    std::map<TextureKeyInput, std::uint64_t> guest_list_keys;
+    TextureKeyInput guest_last_input{};
+    std::uint64_t guest_last_key{};
+    bool guest_last_valid{};
+    std::unordered_map<std::uint64_t, std::uint16_t> guest_textures;  // key -> max_seen_v
+    std::shared_ptr<TexturePack> guest_pack;
+    // From the render thread: keys it dropped, all of them, and the pack it
+    // opened, for the game thread to take at its next texture.
+    struct Dropped {
+        std::mutex mutex;
+        std::vector<std::uint64_t> keys;
+        bool all{};
+        std::shared_ptr<TexturePack> pack;
+        std::atomic<bool> any{};
+    };
+    std::unique_ptr<Dropped> dropped = std::make_unique<Dropped>();
+    void report_dropped(std::uint64_t key, bool all);
+
+    // --- The render thread -------------------------------------------------
+    // <prefix>_RENDER_THREAD: draws are recorded, and frames submitted and
+    // presented, on a thread of the renderer's own while the game's thread
+    // runs on. The game's thread keeps what reads guest memory (submit()'s
+    // half of a draw, block transfers, the write-back) and hands the rest
+    // over in order; anything else that touches the renderer's state first
+    // waits for the thread to finish what it was handed (sync()). Frame
+    // interpolation presents between flips on the game's thread, so the
+    // thread stands idle while it is on.
+    bool thread_enabled{};  // the switch, read at start
+    bool threaded{};        // the game's thread hands work over now
+    struct RenderThread {
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable wake;  // work, or stop
+        std::condition_variable idle;  // nothing left to do
+        std::deque<std::unique_ptr<RenderJob>> jobs;
+        bool waiting{};  // the thread sleeps on `wake`
+        bool busy{};     // the thread runs jobs it has taken
+        bool stop{};
+    } render;
+    // Jobs the game's thread has not handed over yet: a batch at a time, so
+    // the thread is woken a few times a frame rather than at every draw.
+    std::vector<std::unique_ptr<RenderJob>> pending_jobs;
+    // The render thread's answer to "is frame interpolation on?" at its last
+    // present: the game's thread stops handing work over while it is.
+    std::atomic<bool> interpolating_now{};
+    bool guest_fast_forward{};  // set_fast_forward() as the game's thread last said
+    [[nodiscard]] bool on_render_thread() const {
+        return render.thread.joinable() && std::this_thread::get_id() == render.thread.get_id();
+    }
+    // The write-back with the thread on: the render thread takes the frame's
+    // pixels once its fence has signalled (begin_frame()) and leaves them
+    // here; the game's thread stores them into guest memory at its next flip.
+    std::mutex handoff_mutex;
+    bool handoff_has{};
+    WritebackFrame handoff_ready{};
+    std::vector<std::uint32_t> handoff_pixels;
+    std::vector<std::uint32_t> guest_store_pixels;
+    // The interface drawn over the game, copied for the render thread
+    // (set_ui_draw_data()); ui_draw_data points into it.
+    std::unique_ptr<ClonedDrawData> ui_clone;
+    // target_extent as the game's thread may read it (width << 32 | height).
+    std::atomic<std::uint64_t> target_extent_seen{};
+    void note_target_extent() {
+        target_extent_seen.store(static_cast<std::uint64_t>(target_extent.width) << 32u | target_extent.height);
+    }
+    void start_render_thread();
+    void stop_render_thread();
+    void render_main();
+    void enqueue(std::unique_ptr<RenderJob> job);
+    void flush_jobs();
+    // Waits until the render thread has done everything handed to it; after
+    // it the calling thread may touch the renderer's state itself.
+    void sync();
+    // Runs `work` on the render thread when work is handed over now, else
+    // here, once the render thread is done with what it had.
+    template <typename Function>
+    void on_render(Function &&work) {
+        if (threaded) {
+            enqueue(make_job(std::forward<Function>(work)));
+            return;
+        }
+        sync();
+        work();
+    }
 };
+
+// What submit() found in guest memory for a draw.
+struct VulkanRenderer::GuestDraw {
+    Impl::FramebufferTexture framebuffer;
+    Impl::TextureRequest texture;
+};
+
+void VulkanRenderer::Impl::start_render_thread() {
+    if (render.thread.joinable()) return;
+    render.stop = false;
+    render.thread = std::thread([this] { render_main(); });
+    std::cout << "[render] render thread on (" << portablekit::env_name("RENDER_THREAD") << "=0 turns it off)"
+              << std::endl;
+}
+
+void VulkanRenderer::Impl::stop_render_thread() {
+    if (!render.thread.joinable()) return;
+    sync();
+    {
+        const std::lock_guard guard(render.mutex);
+        render.stop = true;
+    }
+    render.wake.notify_one();
+    render.thread.join();
+    threaded = false;
+}
+
+void VulkanRenderer::Impl::render_main() {
+    perf::mark_render_thread();
+    std::deque<std::unique_ptr<RenderJob>> batch;
+    std::unique_lock lock(render.mutex);
+    for (;;) {
+        render.waiting = true;
+        render.wake.wait(lock, [this] { return render.stop || !render.jobs.empty(); });
+        render.waiting = false;
+        if (render.jobs.empty()) break;  // stopping, with nothing left
+        batch.swap(render.jobs);
+        render.busy = true;
+        lock.unlock();
+        const perf::Clock::time_point start = perf::Clock::now();
+        for (std::unique_ptr<RenderJob> &job : batch) job->run();
+        batch.clear();
+        perf::add_render_thread_time(perf::Clock::now() - start);
+        lock.lock();
+        render.busy = false;
+        if (render.jobs.empty()) render.idle.notify_all();
+    }
+}
+
+void VulkanRenderer::Impl::enqueue(std::unique_ptr<RenderJob> job) {
+    pending_jobs.push_back(std::move(job));
+    if (pending_jobs.size() >= 24u) flush_jobs();
+}
+
+void VulkanRenderer::Impl::flush_jobs() {
+    if (pending_jobs.empty()) return;
+    bool wake = false;
+    {
+        const std::lock_guard guard(render.mutex);
+        for (std::unique_ptr<RenderJob> &job : pending_jobs) render.jobs.push_back(std::move(job));
+        wake = render.waiting;
+    }
+    pending_jobs.clear();
+    if (wake) render.wake.notify_one();
+}
+
+void VulkanRenderer::Impl::sync() {
+    // The render thread never waits for itself: a job may call what syncs.
+    if (!render.thread.joinable() || std::this_thread::get_id() == render.thread.get_id()) return;
+    flush_jobs();
+    std::unique_lock lock(render.mutex);
+    render.idle.wait(lock, [this] { return render.jobs.empty() && !render.busy; });
+}
 
 void VulkanRenderer::Impl::compare_gpu_decode(std::uint32_t from) {
     FrameSlot &frame = slots[from];
@@ -2256,6 +2520,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
     // Until the window's size is known, which Auto and Fill need.
     const std::uint32_t scale = impl.requested_scale != 0u ? impl.requested_scale : 2u;
     impl.target_extent = {kPspWidth * scale, kPspHeight * scale};
+    impl.note_target_extent();
     impl.requested_present = player.present_mode;
     impl.aspect = usable_aspect(player.aspect);
     impl.sharp_screen = player.sharp_screen;
@@ -2484,6 +2749,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
     if (!impl.create_swapchain(error)) return false;
     // No target exists yet: they are made at this size when first drawn.
     impl.target_extent = impl.wanted_target_extent();
+    impl.note_target_extent();
 
     std::array<VkAttachmentDescription, 2> attachments{};
     attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -2863,6 +3129,18 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
     std::cout << "Renderer: Vulkan on " << properties.deviceName << ", target " << impl.target_extent.width << "x"
               << impl.target_extent.height << "\n";
     impl.ready = true;
+    // <prefix>_RENDER_THREAD=1: record and present on a thread of the
+    // renderer's own (Impl::render). Not with the switches that compare what
+    // was drawn against guest memory, or dump textures out of it.
+    {
+        const char *text = portablekit::env("RENDER_THREAD");
+        const bool wanted = text != nullptr && std::string_view(text) != "0";
+        const bool blocked = impl.check_gpu_decode || impl.dumper != nullptr;
+        if (wanted && blocked)
+            std::cout << "[render] render thread off: a texture dump or a GPU decode check is on" << std::endl;
+        impl.thread_enabled = wanted && !blocked;
+        if (impl.thread_enabled) impl.start_render_thread();
+    }
     return true;
 }
 
@@ -4407,30 +4685,7 @@ VulkanRenderer::Impl::Texture &VulkanRenderer::Impl::texture_for(const GuestMemo
         dumper->dump(memory, state, max_seen_v, pack ? pack->options() : kDumpOptions, pixels.data());
     }
 
-    // <prefix>_TEXTURE_CACHE_LIMIT keeps fewer textures, to test eviction.
-    static const std::size_t cache_limit = [] {
-        const char *text = portablekit::env("TEXTURE_CACHE_LIMIT");
-        const std::size_t limit = text != nullptr ? std::strtoull(text, nullptr, 10) : 0u;
-        return limit != 0u ? std::min(limit, kMaxCachedTextures) : kMaxCachedTextures;
-    }();
-    if (textures.size() >= cache_limit) {
-        auto oldest = textures.begin();
-        for (auto it = textures.begin(); it != textures.end(); ++it) {
-            if (it->second.last_used < oldest->second.last_used) oldest = it;
-        }
-        destroyed_texture_clock = std::max(destroyed_texture_clock, oldest->second.last_used);
-        if (async_uploads()) {
-            // The frame being recorded may have drawn it already.
-            slots[slot].retired_textures.push_back(oldest->second);
-        } else {
-            const perf::Clock::time_point wait_start = perf::Clock::now();
-            vkQueueWaitIdle(queue);
-            perf::add_wait_time(perf::Clock::now() - wait_start, perf::Stall::Evict);
-            destroy_texture(oldest->second);
-        }
-        textures.erase(oldest);
-        ++textures_erased;
-    }
+    make_room_for_texture();
     Texture texture = job ? create_texture_image(state.width, state.height)
                           : create_texture(state.width, state.height, pixels.data());
     if (texture.descriptor == VK_NULL_HANDLE) return white_texture;
@@ -4450,6 +4705,154 @@ VulkanRenderer::Impl::Texture &VulkanRenderer::Impl::texture_for(const GuestMemo
     memo->texture = &cached;
     memo->erased = textures_erased;
     return cached;
+}
+
+void VulkanRenderer::Impl::make_room_for_texture() {
+    // <prefix>_TEXTURE_CACHE_LIMIT keeps fewer textures, to test eviction.
+    static const std::size_t cache_limit = [] {
+        const char *text = portablekit::env("TEXTURE_CACHE_LIMIT");
+        const std::size_t limit = text != nullptr ? std::strtoull(text, nullptr, 10) : 0u;
+        return limit != 0u ? std::min(limit, kMaxCachedTextures) : kMaxCachedTextures;
+    }();
+    if (textures.size() < cache_limit) return;
+    auto oldest = textures.begin();
+    for (auto it = textures.begin(); it != textures.end(); ++it) {
+        if (it->second.last_used < oldest->second.last_used) oldest = it;
+    }
+    destroyed_texture_clock = std::max(destroyed_texture_clock, oldest->second.last_used);
+    if (async_uploads()) {
+        // The frame being recorded may have drawn it already.
+        slots[slot].retired_textures.push_back(oldest->second);
+    } else {
+        const perf::Clock::time_point wait_start = perf::Clock::now();
+        vkQueueWaitIdle(queue);
+        perf::add_wait_time(perf::Clock::now() - wait_start, perf::Stall::Evict);
+        destroy_texture(oldest->second);
+    }
+    report_dropped(oldest->first, false);
+    textures.erase(oldest);
+    ++textures_erased;
+}
+
+void VulkanRenderer::Impl::report_dropped(std::uint64_t key, bool all) {
+    if (!thread_enabled) return;
+    Dropped &d = *dropped;
+    const std::lock_guard guard(d.mutex);
+    if (all) {
+        d.all = true;
+        d.keys.clear();
+        d.pack = pack;
+    } else if (!d.all) {
+        d.keys.push_back(key);
+    }
+    d.any.store(true, std::memory_order_release);
+}
+
+void VulkanRenderer::Impl::prepare_texture(const GuestMemory &memory, const DrawCall &call, TextureRequest &request) {
+    const perf::SplitScope split(perf::Split::Texture);
+    if (Dropped &d = *dropped; d.any.exchange(false, std::memory_order_acquire)) {
+        const std::lock_guard guard(d.mutex);
+        if (d.all) {
+            guest_textures.clear();
+            guest_pack = d.pack;
+            d.all = false;
+            d.pack.reset();
+        }
+        for (const std::uint64_t key : d.keys) guest_textures.erase(key);
+        d.keys.clear();
+    }
+    const TextureState &state = call.texture;
+    const TextureKeyInput input{state.address,
+                                state.buffer_width,
+                                static_cast<std::uint32_t>(state.width) << 16u | state.height,
+                                static_cast<std::uint32_t>(state.format),
+                                state.clut_address,
+                                state.clut_format,
+                                state.swizzled};
+    if (!guest_last_valid || !(input == guest_last_input)) {
+        auto [entry, inserted] = guest_list_keys.try_emplace(input);
+        if (inserted) entry->second = texture_key(memory, state);
+        guest_last_input = input;
+        guest_last_key = entry->second;
+        guest_last_valid = true;
+    }
+    request.wanted = true;
+    request.key = guest_last_key;
+    TexturePack *const texture_pack = guest_pack.get();
+    const auto known = guest_textures.find(request.key);
+    if (known == guest_textures.end()) {
+        // New to the render thread: its bytes go with the draw, to be
+        // decoded in the background as texture_for() does.
+        if (async_uploads() && background_decode()) {
+            request.job = std::make_shared<DecodeJob>();
+            if (!snapshot_texture(memory, state, request.job->snapshot)) request.job.reset();
+        }
+        if (!request.job && (!decode_texture(memory, state, request.pixels) || request.pixels.empty())) {
+            // Drawn white, and tried again at its next draw, as before.
+            request.undecodable = true;
+            return;
+        }
+        request.max_seen_v = state.height == 512u ? update_max_seen_v(0u, drawn_max_v(call), call.through) : 0u;
+        request.replacement_set = true;
+        if (texture_pack != nullptr) request.replacement = texture_pack->find(memory, state, request.max_seen_v);
+        guest_textures.emplace(request.key, request.max_seen_v);
+        return;
+    }
+    // A 512-tall texture drawn further down than before is hashed again over
+    // the rows now in use, and may find another image in the pack.
+    if (texture_pack != nullptr && state.height == 512u && known->second < 512u) {
+        const std::uint16_t seen = update_max_seen_v(known->second, drawn_max_v(call), call.through);
+        if (seen != known->second) {
+            known->second = seen;
+            request.max_seen_v = seen;
+            request.replacement_set = true;
+            request.replacement = texture_pack->find(memory, state, seen);
+        }
+    }
+}
+
+VkDescriptorSet VulkanRenderer::Impl::texture_descriptor(const TextureRequest &request, const DrawCall &call) {
+    const perf::SplitScope split(perf::Split::Texture);
+    if (!request.wanted || request.undecodable) return white_texture.descriptor;
+    Texture *texture = nullptr;
+    if (const auto found = textures.find(request.key); found != textures.end()) {
+        texture = &found->second;
+    } else if (request.job || !request.pixels.empty()) {
+        const TextureState &state = call.texture;
+        make_room_for_texture();
+        // As texture_for() makes it: in the background from the bytes copied
+        // out of guest memory, uploaded when the frame is submitted.
+        Texture made = request.job ? create_texture_image(state.width, state.height)
+                                   : create_texture(state.width, state.height, request.pixels.data());
+        if (made.descriptor == VK_NULL_HANDLE) return white_texture.descriptor;
+        if (request.job) {
+            if (!decode_pool) {
+                const std::uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
+                decode_pool = std::make_unique<DecodePool>(std::clamp(cores / 2u, 1u, 3u));
+            }
+            decode_pool->submit(request.job);
+            pending_textures.push_back({request.job, made.image, state.width, state.height});
+        }
+        texture = &textures.emplace(request.key, std::move(made)).first->second;
+    } else {
+        // The game thread took it for one held here, dropped since: it hands
+        // the bytes over again at the next draw.
+        report_dropped(request.key, false);
+        return white_texture.descriptor;
+    }
+    texture->last_used = ++texture_clock;
+    if (request.replacement_set) {
+        texture->replacement = request.replacement;
+        texture->max_seen_v = request.max_seen_v;
+    }
+    if (texture->replacement && pack) {
+        // Until the image is decoded and on the GPU, the original is drawn.
+        if (const VkDescriptorSet replaced = replacements.descriptor(*texture->replacement, *pack, frames)) {
+            ++replaced_draws;
+            return replaced;
+        }
+    }
+    return texture->descriptor;
 }
 
 VkDescriptorSet VulkanRenderer::Impl::texture_descriptor(const GuestMemory &memory, const DrawCall &call) {
@@ -4489,6 +4892,7 @@ void VulkanRenderer::Impl::apply_texture_pack() {
     pack_status.clear();
     if (!wanted) {
         pack_status = pack_held ? "Updating" : "Off";
+        report_dropped(0u, true);
         return;
     }
     // <prefix>_TEXTURE_PACK may name the folder, or the player may use a pack
@@ -4505,10 +4909,12 @@ void VulkanRenderer::Impl::apply_texture_pack() {
         else if (pack_location.source == TexturePackLocation::Source::Installed) pack_status = "Not installed";
         else pack_status = "Folder missing: " + install::path_to_utf8(folder);
         std::cout << "[texpack] " << error << "\n";
+        report_dropped(0u, true);
         return;
     }
     pack_status = std::to_string(pack->entry_count()) + " textures";
     std::cout << "[texpack] " << pack->entry_count() << " textures from " << folder.string() << "\n";
+    report_dropped(0u, true);
 }
 
 namespace {
@@ -4578,7 +4984,7 @@ void VulkanRenderer::Impl::trace_framebuffer_texture(const DrawCall &call) {
                   << " filter=" << texture.min_filter << "/" << texture.mag_filter << " wrap=" << texture.wrap_s
                   << "/" << texture.wrap_t << " in framebuffer 0x" << std::hex << address << std::dec
                   << " (stride=" << target.stride << " fmt=" << target.format
-                  << " last drawn frame " << target.last_drawn_frame << ", offset "
+                  << " draw " << target.draw_serial << ", offset "
                   << (texture.address - address) << ") drawn to 0x" << std::hex << call.target.color_address
                   << std::dec << " fmt=" << call.target.color_format << (call.through ? " through" : " transform")
                   << " prim=" << static_cast<int>(call.primitive) << " verts=" << call.vertices.size()
@@ -4690,7 +5096,7 @@ void VulkanRenderer::Impl::record_writeback(std::uint32_t address) {
     const auto found = targets.find(address);
     if (found == targets.end() || (GuestMemory::canonical(address) & 0x1F000000u) != 0x04000000u) return;
     Target &target = found->second;
-    if (!target.initialized || target.guest_words.empty() || target.stride < kPspWidth) return;
+    if (!target.initialized || target.stride < kPspWidth) return;
     if (writeback_image == VK_NULL_HANDLE) {
         std::string error;
         if (!create_writeback(error)) {
@@ -4739,7 +5145,8 @@ void VulkanRenderer::Impl::record_writeback(std::uint32_t address) {
 }
 
 // Reads one guest word from every 256 bytes of the buffer a target stands for.
-void VulkanRenderer::Impl::snapshot_guest_words(const GuestMemory &memory, std::uint32_t address, Target &target) {
+void VulkanRenderer::Impl::snapshot_guest_words(const GuestMemory &memory, std::uint32_t address,
+                                                GuestTarget &target) {
     const std::uint32_t bytes = target.stride * kPspHeight * framebuffer_bytes_per_pixel(target.format);
     target.guest_words.clear();
     ++target.snapshot_serial;
@@ -4771,10 +5178,11 @@ VulkanRenderer::Impl::FramebufferTexture VulkanRenderer::Impl::find_framebuffer_
         texture.height == 0u)
         return {};
     const std::uint32_t texture_address = GuestMemory::canonical(texture.address);
-    Target *best = nullptr;
+    GuestTarget *best = nullptr;
     std::uint32_t best_base = 0u;
-    for (auto &[address, target] : targets) {
-        if (!target.initialized || target.guest_words.empty()) continue;
+    std::uint32_t best_address = 0u;
+    for (auto &[address, target] : guest_targets) {
+        if (target.guest_words.empty()) continue;
         const std::uint32_t bytes_per_pixel = framebuffer_bytes_per_pixel(target.format);
         if (texture_bits_per_pixel(texture.format) != bytes_per_pixel * 8u) continue;
         const std::uint32_t base = GuestMemory::canonical(address);
@@ -4784,6 +5192,7 @@ VulkanRenderer::Impl::FramebufferTexture VulkanRenderer::Impl::find_framebuffer_
         if (best == nullptr || target.draw_serial > best->draw_serial) {
             best = &target;
             best_base = base;
+            best_address = address;
         }
     }
     if (best == nullptr) return {};
@@ -4801,9 +5210,9 @@ VulkanRenderer::Impl::FramebufferTexture VulkanRenderer::Impl::find_framebuffer_
     const std::size_t last = std::min<std::size_t>(best->guest_words.size(), (end - best_base + 255u) / 256u);
     // <prefix>_NO_FB_CHECK_CACHE compares every word every time.
     static const bool full_always = portablekit::env("NO_FB_CHECK_CACHE") != nullptr;
-    if (best->checked_frame != frames || best->checked_snapshot != best->snapshot_serial) {
+    if (best->checked_frame != guest_frames || best->checked_snapshot != best->snapshot_serial) {
         best->checked.clear();
-        best->checked_frame = frames;
+        best->checked_frame = guest_frames;
         best->checked_snapshot = best->snapshot_serial;
     }
     const bool compared = !full_always && std::any_of(best->checked.begin(), best->checked.end(), [&](const auto &r) {
@@ -4830,7 +5239,7 @@ VulkanRenderer::Impl::FramebufferTexture VulkanRenderer::Impl::find_framebuffer_
     }
     if (!compared) best->checked.emplace_back(texture_address, end);
     const std::uint32_t pixel = (texture_address - best_base) / bytes_per_pixel;
-    FramebufferTexture found{best, pixel % best->stride, pixel / best->stride};
+    FramebufferTexture found{best_address, pixel % best->stride, pixel / best->stride};
     if (found.x >= kPspWidth || found.y >= kPspHeight) return {};
     return found;
 }
@@ -4846,7 +5255,11 @@ std::uint32_t VulkanRenderer::Impl::target_address(const Target &target) const {
 VkDescriptorSet VulkanRenderer::Impl::framebuffer_descriptor(const FramebufferTexture &source, std::uint32_t width,
                                                              std::uint32_t height, bool opaque) {
     const perf::SplitScope split(perf::Split::Texture);
-    Target &target = *source.target;
+    // Drawn in an earlier draw, which made it; one given up before its pass
+    // began did not.
+    const auto source_target = targets.find(source.address);
+    if (source_target == targets.end() || !source_target->second.initialized) return VK_NULL_HANDLE;
+    Target &target = source_target->second;
     if (target.copy == VK_NULL_HANDLE) {
         std::string error;
         if (!create_image(target_extent.width, target_extent.height, VK_FORMAT_R8G8B8A8_UNORM,
@@ -4949,7 +5362,11 @@ VkDescriptorSet VulkanRenderer::Impl::framebuffer_descriptor(const FramebufferTe
 VkDescriptorSet VulkanRenderer::Impl::framebuffer_extract(const FramebufferTexture &source, std::uint32_t width,
                                                           std::uint32_t height, bool opaque) {
     const perf::SplitScope split(perf::Split::Texture);
-    Target &target = *source.target;
+    // Drawn in an earlier draw, which made it; one given up before its pass
+    // began did not.
+    const auto source_target = targets.find(source.address);
+    if (source_target == targets.end() || !source_target->second.initialized) return VK_NULL_HANDLE;
+    Target &target = source_target->second;
     const double scale_x = static_cast<double>(target_extent.width) / kPspWidth;
     const double scale_y = static_cast<double>(target_extent.height) / kPspHeight;
     const auto x0 = static_cast<std::int32_t>(std::floor(source.x * scale_x));
@@ -5062,37 +5479,59 @@ std::optional<VulkanRenderer::Impl::TargetAlias> VulkanRenderer::Impl::alias_for
     static const bool off = portablekit::env("NO_TARGET_ALIASES") != nullptr;
     if (off) return std::nullopt;
     const std::uint32_t address = drawn.color_address;
+    // Most draws go where the one before went.
+    AliasQuery &last = last_alias_query;
+    if (last.valid && last.address == address && last.stride == drawn.color_stride &&
+        last.format == drawn.color_format && last.version == guest_targets_version)
+        return last.result;
+    const auto answer = [&](std::optional<TargetAlias> result) {
+        last = {true, address, drawn.color_stride, drawn.color_format, guest_targets_version, result};
+        return result;
+    };
     if (const auto known = target_aliases.find(address); known != target_aliases.end()) {
-        const auto base = targets.find(known->second.base);
-        if (base != targets.end() && base->second.stride == drawn.color_stride &&
+        const auto base = guest_targets.find(known->second.base);
+        if (base != guest_targets.end() && base->second.stride == drawn.color_stride &&
             base->second.format == drawn.color_format)
-            return known->second;
+            return answer(known->second);
         target_aliases.erase(known);
     }
     // A target of its own already: drawn there before any buffer around it.
-    if (targets.contains(address)) return std::nullopt;
+    if (guest_targets.contains(address)) return answer(std::nullopt);
     const std::uint32_t bytes_per_pixel = framebuffer_bytes_per_pixel(drawn.color_format);
     const std::uint32_t row = drawn.color_stride * bytes_per_pixel;
-    if (row == 0u) return std::nullopt;
+    if (row == 0u) return answer(std::nullopt);
     // The nearest target below the address whose area holds it.
-    for (auto it = targets.lower_bound(address); it != targets.begin();) {
+    for (auto it = guest_targets.lower_bound(address); it != guest_targets.begin();) {
         --it;
         const auto &[base, target] = *it;
-        if (!target.initialized || target.stride != drawn.color_stride || target.format != drawn.color_format)
-            continue;
+        if (target.stride != drawn.color_stride || target.format != drawn.color_format) continue;
         const std::uint32_t offset = address - base;
         if (offset >= row * kPspHeight) break;
-        if (offset % bytes_per_pixel != 0u) return std::nullopt;
+        if (offset % bytes_per_pixel != 0u) return answer(std::nullopt);
         const TargetAlias alias{base, (offset % row) / bytes_per_pixel, offset / row};
-        if (alias.x >= kPspWidth || alias.y >= kPspHeight) return std::nullopt;
+        if (alias.x >= kPspWidth || alias.y >= kPspHeight) return answer(std::nullopt);
         static const bool trace = portablekit::env("TRACE_FB_TEXTURES") != nullptr;
         if (trace)
-            std::cout << "[fbtex] frame " << frames << " 0x" << std::hex << address << " is 0x" << base << std::dec
-                      << " at " << alias.x << "," << alias.y << "\n";
+            std::cout << "[fbtex] frame " << guest_frames << " 0x" << std::hex << address << " is 0x" << base
+                      << std::dec << " at " << alias.x << "," << alias.y << "\n";
         target_aliases[address] = alias;
-        return alias;
+        return answer(alias);
     }
-    return std::nullopt;
+    return answer(std::nullopt);
+}
+
+void VulkanRenderer::Impl::note_guest_draw(const GuestMemory &memory, const RenderTarget &drawn) {
+    auto [found, inserted] = guest_targets.try_emplace(drawn.color_address);
+    if (inserted) ++guest_targets_version;
+    GuestTarget &target = found->second;
+    const bool layout_changed = target.stride != drawn.color_stride || target.format != drawn.color_format;
+    if (layout_changed) ++guest_targets_version;
+    target.stride = drawn.color_stride;
+    target.format = drawn.color_format;
+    if (layout_changed || target.guest_words.empty() || target.last_drawn_frame != guest_frames)
+        snapshot_guest_words(memory, drawn.color_address, target);
+    target.last_drawn_frame = guest_frames;
+    target.draw_serial = ++guest_draw_counter;
 }
 
 void VulkanRenderer::Impl::destroy_extracts() {
@@ -5682,6 +6121,7 @@ void VulkanRenderer::request_quit() noexcept {
 }
 
 void VulkanRenderer::hold_frame(bool hold) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_) return;
     Impl &impl = *impl_;
     if (!impl.ready || hold == impl.holding) return;
@@ -5811,9 +6251,9 @@ void VulkanRenderer::Impl::resize_targets(VkExtent2D extent) {
     targets.clear();
     // Extracts name targets that are going; they are filled again on use.
     for (Extract &e : extracts) e.target = nullptr;
-    target_aliases.clear();
     const VkExtent2D old_extent = target_extent;
     target_extent = extent;
+    note_target_extent();
     std::vector<std::pair<Target *, const Target *>> copies;
     for (const auto &[address, old_target] : old_targets) {
         std::string error;
@@ -5824,9 +6264,7 @@ void VulkanRenderer::Impl::resize_targets(VkExtent2D extent) {
         }
         target->stride = old_target.stride;
         target->format = old_target.format;
-        target->last_drawn_frame = old_target.last_drawn_frame;
         target->draw_serial = old_target.draw_serial;
-        target->guest_words = old_target.guest_words;
         if (old_target.initialized) copies.emplace_back(target, &old_target);
     }
     run_commands([&](VkCommandBuffer commands) {
@@ -5857,6 +6295,7 @@ void VulkanRenderer::Impl::resize_targets(VkExtent2D extent) {
 }
 
 void VulkanRenderer::set_internal_scale(std::uint32_t scale) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_) return;
     impl_->requested_scale = std::min(scale, settings::kMaxInternalScale);
     impl_->resize_now = true;
@@ -5864,6 +6303,7 @@ void VulkanRenderer::set_internal_scale(std::uint32_t scale) {
 }
 
 void VulkanRenderer::set_window_scale(std::uint32_t scale) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_ || impl_->window == nullptr) return;
     scale = std::clamp<std::uint32_t>(scale, 1u, settings::kMaxWindowScale);
     if ((SDL_GetWindowFlags(impl_->window) & SDL_WINDOW_FULLSCREEN) != 0u) return;
@@ -5872,6 +6312,7 @@ void VulkanRenderer::set_window_scale(std::uint32_t scale) {
 }
 
 void VulkanRenderer::set_fullscreen(bool fullscreen) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_ || impl_->window == nullptr) return;
 #if defined(__ANDROID__)
     fullscreen = true;
@@ -5881,6 +6322,7 @@ void VulkanRenderer::set_fullscreen(bool fullscreen) {
 }
 
 void VulkanRenderer::set_present_mode(settings::PresentMode mode) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_) return;
     impl_->requested_present = mode;
     impl_->swapchain_dirty = true;
@@ -5896,6 +6338,7 @@ bool VulkanRenderer::supports_present_mode(settings::PresentMode mode) const {
 }
 
 void VulkanRenderer::set_aspect(settings::Aspect aspect) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_) return;
     impl_->aspect = usable_aspect(aspect);
     impl_->resize_now = true;
@@ -5912,26 +6355,31 @@ settings::Aspect VulkanRenderer::usable_aspect(settings::Aspect aspect) noexcept
 }
 
 float VulkanRenderer::game_aspect() const noexcept {
-    if (!impl_ || impl_->aspect != settings::Aspect::Fill || impl_->target_extent.height == 0u)
+    const std::array<std::uint32_t, 2> size = target_size();
+    if (!impl_ || impl_->aspect != settings::Aspect::Fill || size[1] == 0u)
         return static_cast<float>(kPspWidth) / static_cast<float>(kPspHeight);
-    return static_cast<float>(impl_->target_extent.width) / static_cast<float>(impl_->target_extent.height);
+    return static_cast<float>(size[0]) / static_cast<float>(size[1]);
 }
 
 std::array<std::uint32_t, 2> VulkanRenderer::target_size() const noexcept {
     if (!impl_) return {kPspWidth, kPspHeight};
-    return {impl_->target_extent.width, impl_->target_extent.height};
+    const std::uint64_t seen = impl_->target_extent_seen.load();
+    return {static_cast<std::uint32_t>(seen >> 32u), static_cast<std::uint32_t>(seen)};
 }
 
 void VulkanRenderer::set_sharp_screen(bool sharp) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (impl_) impl_->sharp_screen = sharp;
 }
 
 void VulkanRenderer::set_texture_pack(bool enabled) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     // Applied at the next begin_frame(), where no frame is being recorded.
     if (impl_) impl_->pack_wanted = enabled;
 }
 
 std::string VulkanRenderer::texture_pack_status() const {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_) return {};
     const Impl &impl = *impl_;
     if (impl.pack_held) return "Updating";
@@ -5942,25 +6390,30 @@ std::string VulkanRenderer::texture_pack_status() const {
 }
 
 void VulkanRenderer::reload_texture_pack() {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (impl_) impl_->pack_reload = true;
 }
 
 void VulkanRenderer::hold_texture_pack(bool hold) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (impl_) impl_->pack_held = hold;
 }
 
 bool VulkanRenderer::texture_pack_held() const {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     return impl_ && impl_->pack_held && !impl_->pack_applied && !impl_->pack;
 }
 
 std::filesystem::path VulkanRenderer::textures_root() { return install::user_data_directory() / "textures"; }
 
 std::string VulkanRenderer::texture_pack_folder() const {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     const std::string in_place = settings::current().texture_pack_folder;
     return install::path_to_utf8(texture_pack_location(textures_root(), portablekit::game().disc_id, in_place).folder);
 }
 
 void VulkanRenderer::set_sharp_textures(bool sharp) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     Impl &impl = *impl_;
     if (!impl.ready || impl.recording || impl.sharp_textures == sharp) return;
     impl.sharp_textures = sharp;
@@ -6008,10 +6461,12 @@ void VulkanRenderer::set_sharp_textures(bool sharp) {
 }
 
 void VulkanRenderer::set_perf_overlay(bool visible) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (impl_) impl_->overlay_visible = impl_->overlay_ready && visible;
 }
 
 void VulkanRenderer::capture_window(const std::string &path) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_ || !impl_->ready) return;
     if ((impl_->swapchain_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0u) {
         std::cout << "[render] this swapchain cannot be read back; no window capture\n";
@@ -6021,6 +6476,7 @@ void VulkanRenderer::capture_window(const std::string &path) {
 }
 
 bool VulkanRenderer::initialize_ui(std::string &error) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     Impl &impl = *impl_;
     if (!impl.ready) {
         error = "no renderer";
@@ -6080,6 +6536,7 @@ bool VulkanRenderer::initialize_ui(std::string &error) {
 }
 
 void VulkanRenderer::shutdown_ui() {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     Impl &impl = *impl_;
     if (!impl.ui_ready) return;
     vkDeviceWaitIdle(impl.device);
@@ -6097,6 +6554,7 @@ void VulkanRenderer::begin_ui_frame() {
 
 std::uint64_t VulkanRenderer::create_ui_image(std::uint32_t width, std::uint32_t height,
                                               const std::uint32_t *pixels) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_ || !impl_->ui_ready || width == 0u || height == 0u || pixels == nullptr) return 0u;
     Impl &impl = *impl_;
     Impl::Texture texture = impl.create_texture(width, height, pixels);
@@ -6107,10 +6565,33 @@ std::uint64_t VulkanRenderer::create_ui_image(std::uint32_t width, std::uint32_t
 }
 
 void VulkanRenderer::set_ui_draw_data(ImDrawData *draw_data) {
-    if (impl_) impl_->ui_draw_data = draw_data;
+    if (!impl_) return;
+    Impl &impl = *impl_;
+    if (!impl.threaded || draw_data == nullptr) {
+        impl.on_render([&impl, draw_data] { impl.ui_draw_data = draw_data; });
+        return;
+    }
+    // ImGui builds the next frame while the render thread draws this one, so
+    // the render thread draws a copy. Textures the interface changed (a new
+    // glyph, an image) are updated first, here, once the thread is idle:
+    // ImGui's own state must not change under the thread.
+    if (impl.ui_ready && draw_data->Textures != nullptr) {
+        bool pending = false;
+        for (ImTextureData *texture : *draw_data->Textures) pending = pending || texture->Status != ImTextureStatus_OK;
+        if (pending) {
+            impl.sync();
+            for (ImTextureData *texture : *draw_data->Textures)
+                if (texture->Status != ImTextureStatus_OK) ImGui_ImplVulkan_UpdateTexture(texture);
+        }
+    }
+    impl.enqueue(make_job([&impl, clone = clone_draw_data(*draw_data)]() mutable {
+        impl.ui_clone = std::move(clone);
+        impl.ui_draw_data = &impl.ui_clone->data;
+    }));
 }
 
 void VulkanRenderer::present_ui(bool show_game) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     Impl &impl = *impl_;
     if (!impl.ready) return;
     if (!impl.recording) begin_frame();
@@ -6143,6 +6624,13 @@ void VulkanRenderer::begin_frame() {
     // With one frame in flight its write-back is taken here, as before;
     // with more, write_back_frame() takes it.
     impl.collect_writeback(impl.slot, false);
+    if (impl.writeback_has_pixels && impl.on_render_thread()) {
+        const std::lock_guard guard(impl.handoff_mutex);
+        std::swap(impl.writeback_pixels, impl.handoff_pixels);
+        impl.handoff_ready = impl.writeback_ready;
+        impl.handoff_has = true;
+        impl.writeback_has_pixels = false;
+    }
     impl.report_pipelines(false);
     impl.apply_texture_pack();
     impl.replacements.begin_frame(impl.frames);
@@ -6205,6 +6693,25 @@ void VulkanRenderer::upload_frame(std::uint32_t display_address, const std::uint
                                   std::uint32_t height, std::uint32_t stride) {
     Impl &impl = *impl_;
     if (!impl.ready || pixels == nullptr || width == 0u || height == 0u || stride < width) return;
+    // The picture is now what guest memory holds there, which texturing
+    // reads correctly anyway.
+    if (const auto guest = impl.guest_targets.find(display_address); guest != impl.guest_targets.end())
+        guest->second.guest_words.clear();
+    if (!impl.threaded) {
+        impl.sync();
+        upload_frame_now(display_address, pixels, width, height, stride);
+        return;
+    }
+    // The pixels are guest memory: copied for the render thread.
+    std::vector<std::uint8_t> copy(pixels, pixels + static_cast<std::size_t>(stride) * height * 4u);
+    impl.enqueue(make_job([this, display_address, copy = std::move(copy), width, height, stride] {
+        upload_frame_now(display_address, copy.data(), width, height, stride);
+    }));
+}
+
+void VulkanRenderer::upload_frame_now(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
+                                      std::uint32_t height, std::uint32_t stride) {
+    Impl &impl = *impl_;
     if (!impl.recording) begin_frame();
     impl.end_pass();
     std::string error;
@@ -6276,11 +6783,11 @@ void VulkanRenderer::upload_frame(std::uint32_t display_address, const std::uint
     impl.last_drawn_target = display_address;
     // The frame came from guest memory, which texturing reads correctly anyway.
     ++target->draw_serial;
-    target->guest_words.clear();
 }
 
 bool VulkanRenderer::gpu_decode() const {
-    if (!impl_ || !impl_->ready || !impl_->gpu_decode_available) return false;
+    // A raw draw points into guest memory, which the render thread cannot read.
+    if (!impl_ || !impl_->ready || !impl_->gpu_decode_available || impl_->thread_enabled) return false;
     // Off unless <prefix>_GPU_DECODE=1 asks for it: on the Steam Deck (radv)
     // the raw vertex path hung the GPU (ring gfx timeout) at the character
     // select screen, and the CPU decode did not. Also off for the paths and
@@ -6303,19 +6810,23 @@ bool VulkanRenderer::check_gpu_decode() const { return impl_ && impl_->check_gpu
 
 void VulkanRenderer::begin_display_list() {
     if (!impl_) return;
-    impl_->list_texture_keys.clear();
-    impl_->last_texture = nullptr;
+    Impl &impl = *impl_;
+    impl.guest_list_keys.clear();
+    impl.guest_last_valid = false;
+    // The render thread's own memo is used only while nothing is handed over.
+    if (impl.threaded) return;
+    impl.sync();
+    impl.list_texture_keys.clear();
+    impl.last_texture = nullptr;
 }
 
+// A draw, in two halves: what needs guest memory, here on the thread that runs
+// the game's display lists, and the rest in draw(), which records it and may
+// run later on the render thread.
 void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     Impl &impl = *impl_;
     if (!impl.ready) return;
     const perf::SplitScope split(perf::Split::Draw);
-    if (!impl.recording) begin_frame();
-    // Presents between flips fall due while the game draws, too: a busy
-    // frame spends most of its time in here.
-    if (impl.cycle_active && (++impl.draws_since_poll & 15u) == 0u)
-        impl.poll_presents(std::chrono::steady_clock::now(), false, false);
     // GPU vertex decode: the draw carries the guest's vertex bytes instead of
     // decoded vertices (GeState::set_raw_vertices).
     const bool raw = call.raw_vertices != nullptr;
@@ -6325,11 +6836,11 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     // by its offset (Impl::TargetAlias).
     if (const std::optional<Impl::TargetAlias> alias = impl.alias_for(call.target)) {
         static const bool trace_aliases = portablekit::env("TRACE_ALIASES") != nullptr;
-        if (trace_aliases && impl.frames % 600u == 0u)
+        if (trace_aliases && impl.guest_frames % 600u == 0u)
             std::printf("[alias] frame %llu 0x%08x -> 0x%08x +%u,%u %s clear %d/%u prim %d verts %zu vp %.1f,%.1f "
                         "scale %.1f,%.1f off %.1f,%.1f scissor %u,%u-%u,%u tex %s 0x%08x %ux%u bufw %u blend %d %u/%u "
                         "depth %d/%d color 0x%08x\n",
-                        static_cast<unsigned long long>(impl.frames), call.target.color_address, alias->base, alias->x,
+                        static_cast<unsigned long long>(impl.guest_frames), call.target.color_address, alias->base, alias->x,
                         alias->y, call.through ? "through" : "3d", call.clear_mode ? 1 : 0, call.clear_flags,
                         static_cast<int>(call.primitive), call.vertices.size(), call.viewport.x_offset,
                         call.viewport.y_offset, call.viewport.x_scale, call.viewport.y_scale, call.viewport.offset_x,
@@ -6345,10 +6856,10 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         // with textures between its draws there (God of War: Ghost of Sparta
         // uploads textures just below its shadow maps' blur buffer).
         Impl::TargetAlias &known = impl.target_aliases[call.target.color_address];
-        if (known.drawn_frame != impl.frames) {
-            known.drawn_frame = impl.frames;
-            if (const auto base = impl.targets.find(alias->base); base != impl.targets.end())
-                base->second.last_drawn_frame = impl.frames - 1u;
+        if (known.drawn_frame != impl.guest_frames) {
+            known.drawn_frame = impl.guest_frames;
+            if (const auto base = impl.guest_targets.find(alias->base); base != impl.guest_targets.end())
+                base->second.last_drawn_frame = impl.guest_frames - 1u;
         }
         DrawCall moved = call;
         moved.target.color_address = alias->base;
@@ -6370,6 +6881,39 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         submit(moved, memory);
         return;
     }
+
+    // A texture in a framebuffer the renderer drew is read from that render
+    // target: the pixels never reach guest memory, which holds whatever was
+    // there before. <prefix>_NO_FB_TEXTURES decodes guest memory as before.
+    static const bool no_fb_textures = portablekit::env("NO_FB_TEXTURES") != nullptr;
+    GuestDraw guest;
+    if (call.texture.enabled && !call.clear_mode && !no_fb_textures)
+        guest.framebuffer = impl.find_framebuffer_texture(memory, call.texture);
+    impl.note_guest_draw(memory, call.target);
+    if (!impl.threaded) {
+        draw(call, guest, &memory);
+        return;
+    }
+    // The render thread draws a copy: GeState reuses its call for the next
+    // draw, and the texture's bytes go with it.
+    if (call.texture.enabled && !call.clear_mode && !guest.framebuffer.found())
+        impl.prepare_texture(memory, call, guest.texture);
+    struct Prepared {
+        DrawCall call;
+        GuestDraw guest;
+    };
+    auto prepared = std::make_unique<Prepared>(Prepared{call, std::move(guest)});
+    impl.enqueue(make_job([this, prepared = std::move(prepared)] { draw(prepared->call, prepared->guest, nullptr); }));
+}
+
+void VulkanRenderer::draw(const DrawCall &call, const GuestDraw &guest, const GuestMemory *memory) {
+    Impl &impl = *impl_;
+    if (!impl.recording) begin_frame();
+    // Presents between flips fall due while the game draws, too: a busy
+    // frame spends most of its time in here.
+    if (impl.cycle_active && (++impl.draws_since_poll & 15u) == 0u)
+        impl.poll_presents(std::chrono::steady_clock::now(), false, false);
+    const bool raw = call.raw_vertices != nullptr;
 
     // Everything becomes a triangle list; sprites expand to two triangles.
     impl.scratch.clear();
@@ -6822,14 +7366,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                 if (first + index < frame.check_drawn.size()) frame.check_drawn[first + index] = 1u;
         }
     }
-    // A texture in a framebuffer the renderer drew is read from that render
-    // target: the pixels never reach guest memory, which holds whatever was
-    // there before. <prefix>_NO_FB_TEXTURES decodes guest memory as before.
-    static const bool no_fb_textures = portablekit::env("NO_FB_TEXTURES") != nullptr;
-    const Impl::FramebufferTexture framebuffer_source =
-        call.texture.enabled && !call.clear_mode && !no_fb_textures
-            ? impl.find_framebuffer_texture(memory, call.texture)
-            : Impl::FramebufferTexture{};
+    const Impl::FramebufferTexture &framebuffer_source = guest.framebuffer;
 
     // Under Fill the game's 480x272 screen is spread over a target of the
     // window's shape, which suits the 3D view the game now draws at that
@@ -6840,7 +7377,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     // background) belong with the 3D view and stay spread.
     float fit_x = 1.0f, fit_y = 1.0f;
     bool fitted = false;
-    if (call.through && !call.clear_mode && framebuffer_source.target == nullptr &&
+    if (call.through && !call.clear_mode && !framebuffer_source.found() &&
         impl.shows(call.target.color_address) && impl.interface_fit(fit_x, fit_y)) {
         float left = impl.scratch.front().x, right = left;
         for (const GpuVertex &vertex : impl.scratch) {
@@ -7076,7 +7613,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         // reads every such texture from the target's copy, as before.
         static const bool no_extracts = portablekit::env("NO_FB_EXTRACTS") != nullptr;
         bool extract = false;
-        if (source.target != nullptr && !no_extracts && source.x + call.texture.width <= kPspWidth &&
+        if (source.found() && !no_extracts && source.x + call.texture.width <= kPspWidth &&
             source.y + call.texture.height <= kPspHeight &&
             (call.texture.width < kPspWidth || call.texture.height < kPspHeight)) {
             extract = !call.through;
@@ -7093,7 +7630,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
             extract ? impl.framebuffer_extract(source, call.texture.width, call.texture.height, opaque)
                     : VK_NULL_HANDLE;
         const VkDescriptorSet copy =
-            source.target != nullptr && extracted == VK_NULL_HANDLE
+            source.found() && extracted == VK_NULL_HANDLE
                 ? impl.framebuffer_descriptor(source, call.texture.width, call.texture.height, opaque)
                 : VK_NULL_HANDLE;
         if (extracted != VK_NULL_HANDLE) {
@@ -7116,7 +7653,8 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                                  (uv[2] * width + static_cast<float>(source.x)) / static_cast<float>(kPspWidth),
                                  (uv[3] * height + static_cast<float>(source.y)) / static_cast<float>(kPspHeight)};
         } else {
-            texture_descriptor = impl.texture_descriptor(memory, call);
+            texture_descriptor = memory != nullptr ? impl.texture_descriptor(*memory, call)
+                                                   : impl.texture_descriptor(guest.texture, call);
         }
     }
 
@@ -7151,14 +7689,10 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         if (!impl.pass_active) return;
     }
     {
+        // Guest memory's side of it is note_guest_draw()'s.
         Impl::Target &drawn = impl.targets.at(call.target.color_address);
-        const bool layout_changed =
-            drawn.stride != call.target.color_stride || drawn.format != call.target.color_format;
         drawn.stride = call.target.color_stride;
         drawn.format = call.target.color_format;
-        if (layout_changed || drawn.guest_words.empty() || drawn.last_drawn_frame != impl.frames)
-            impl.snapshot_guest_words(memory, call.target.color_address, drawn);
-        drawn.last_drawn_frame = impl.frames;
         drawn.draw_serial = ++impl.target_draw_counter;
     }
     // The GE viewport maps normalised device coordinates onto the screen as
@@ -7388,6 +7922,22 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
 void VulkanRenderer::write_back_frame(GuestMemory &memory) {
     Impl &impl = *impl_;
     if (!impl.ready) return;
+    if (impl.threaded) {
+        Impl::WritebackFrame ready{};
+        {
+            const std::lock_guard guard(impl.handoff_mutex);
+            if (!impl.handoff_has) return;
+            impl.handoff_has = false;
+            ready = impl.handoff_ready;
+            std::swap(impl.handoff_pixels, impl.guest_store_pixels);
+        }
+        const perf::SplitScope split(perf::Split::Writeback);
+        const perf::Clock::time_point store_start = perf::Clock::now();
+        impl.store_frame(memory, ready, impl.guest_store_pixels.data());
+        perf::note_stall(perf::Stall::Store, perf::Clock::now() - store_start);
+        return;
+    }
+    impl.sync();
     // The frame before this one, still in flight with two slots: its
     // pixels reach guest memory now, as they did when each frame was waited
     // for before the next was recorded.
@@ -7410,8 +7960,8 @@ void VulkanRenderer::read_back_framebuffer(std::uint32_t source, GuestMemory &me
     const std::uint32_t wanted = GuestMemory::canonical(source);
     std::uint32_t found = 0u;
     bool any = false;
-    for (const auto &[address, target] : impl.targets) {
-        if (!target.initialized || target.guest_words.empty()) continue;
+    for (const auto &[address, target] : impl.guest_targets) {
+        if (target.guest_words.empty()) continue;
         const std::uint32_t base = GuestMemory::canonical(address);
         const std::uint32_t bytes = target.stride * kPspHeight * framebuffer_bytes_per_pixel(target.format);
         if (wanted >= base && wanted - base < bytes) {
@@ -7421,6 +7971,10 @@ void VulkanRenderer::read_back_framebuffer(std::uint32_t source, GuestMemory &me
         }
     }
     if (!any) return;
+    // A copy out of a framebuffer: everything handed to the render thread is
+    // drawn first. A copy of anything else (most of them: textures) never
+    // waits for it.
+    impl.sync();
     if (!impl.recording) begin_frame();
     impl.end_pass();
     impl.record_writeback(found);
@@ -7535,8 +8089,8 @@ void VulkanRenderer::Impl::store_frame(GuestMemory &memory, const WritebackFrame
     static const bool slow_store = portablekit::env("NO_FAST_STORE") != nullptr;
     if (!slow_store && !perf::alternate_off(perf::NewPath::Store)) {
         store_rows(out, frame.stride, frame.format, pixels);
-        const auto target = impl.targets.find(frame.address);
-        if (target != impl.targets.end()) impl.snapshot_guest_words(memory, frame.address, target->second);
+        const auto target = impl.guest_targets.find(frame.address);
+        if (target != impl.guest_targets.end()) impl.snapshot_guest_words(memory, frame.address, target->second);
         return;
     }
     for (std::uint32_t y = 0; y < kPspHeight; ++y) {
@@ -7566,8 +8120,8 @@ void VulkanRenderer::Impl::store_frame(GuestMemory &memory, const WritebackFrame
     }
     // The bytes now differ from the snapshot taken when the target was drawn,
     // and are exactly what it shows: take the snapshot again.
-    const auto target = impl.targets.find(frame.address);
-    if (target != impl.targets.end()) impl.snapshot_guest_words(memory, frame.address, target->second);
+    const auto target = impl.guest_targets.find(frame.address);
+    if (target != impl.guest_targets.end()) impl.snapshot_guest_words(memory, frame.address, target->second);
 }
 
 // Frame interpolation ------------------------------------------------------
@@ -8341,6 +8895,33 @@ bool VulkanRenderer::present(std::uint32_t display_address,
                              std::optional<std::chrono::steady_clock::time_point> moment) {
     Impl &impl = *impl_;
     if (!impl.ready) return false;
+    // The game's side: a frame ends here whatever is shown.
+    ++impl.guest_frames;
+    if (display_address != impl.guest_display[0]) {
+        impl.guest_display[1] = impl.guest_display[0];
+        impl.guest_display[0] = display_address;
+    }
+    bool presented = true;
+    if (impl.threaded) {
+        impl.enqueue(make_job([this, display_address, moment] { present_frame(display_address, moment); }));
+        impl.flush_jobs();
+        // Only a load running fast leaves a flip unshown with the thread on.
+        presented = !impl.guest_fast_forward;
+    } else {
+        impl.sync();
+        presented = present_frame(display_address, moment);
+    }
+    // Work is handed over from the next frame on while frame interpolation is
+    // off; with it on, presents come between flips from this thread.
+    const bool threaded = impl.thread_enabled && !impl.interpolating_now.load();
+    if (impl.threaded && !threaded) impl.sync();
+    impl.threaded = threaded;
+    return presented;
+}
+
+bool VulkanRenderer::present_frame(std::uint32_t display_address,
+                                   std::optional<std::chrono::steady_clock::time_point> moment) {
+    Impl &impl = *impl_;
     if (!impl.recording) begin_frame();
     impl.end_pass();
 
@@ -8510,6 +9091,7 @@ bool VulkanRenderer::present(std::uint32_t display_address,
         // A present due now is made at once; it counts itself.
         impl.busy_presents = {};
         impl.poll_presents(std::chrono::steady_clock::now(), false, false);
+        impl.interpolating_now.store(impl.interpolation_wanted());
         return false;
     }
     // The game's frame as it is, at its flip.
@@ -8522,6 +9104,7 @@ bool VulkanRenderer::present(std::uint32_t display_address,
             impl.ui_draw_data = nullptr;
             impl.submit_frame();
             ++impl.frames;
+            impl.interpolating_now.store(impl.interpolation_wanted());
             return false;
         }
         impl.fast_forward_shown = now;
@@ -8533,16 +9116,18 @@ bool VulkanRenderer::present(std::uint32_t display_address,
     ++impl.frames;
     if (impl.frame_rate != settings::FrameRate::Fps30) impl.report_interpolation();
     impl.follow_window();
+    impl.interpolating_now.store(impl.interpolation_wanted());
     return true;
 }
 
 void VulkanRenderer::present_due() {
-    if (!impl_ || !impl_->ready || !impl_->cycle_active) return;
+    // With the render thread at work interpolation is off.
+    if (!impl_ || !impl_->ready || impl_->threaded || !impl_->cycle_active) return;
     impl_->poll_presents(std::chrono::steady_clock::now(), true, false);
 }
 
 void VulkanRenderer::present_until(std::chrono::steady_clock::time_point wake) {
-    if (!impl_ || !impl_->ready) return;
+    if (!impl_ || !impl_->ready || impl_->threaded) return;
     Impl &impl = *impl_;
     using Clock = std::chrono::steady_clock;
     while (impl.cycle_active) {
@@ -8562,13 +9147,18 @@ void VulkanRenderer::present_until(std::chrono::steady_clock::time_point wake) {
 }
 
 void VulkanRenderer::set_fast_forward(bool on) {
-    if (!impl_ || impl_->fast_forward == on) return;
-    impl_->fast_forward = on;
-    // The first flip of a fast stretch is shown.
-    impl_->fast_forward_shown = {};
+    if (!impl_ || impl_->guest_fast_forward == on) return;
+    Impl &impl = *impl_;
+    impl.guest_fast_forward = on;
+    impl.on_render([&impl, on] {
+        impl.fast_forward = on;
+        // The first flip of a fast stretch is shown.
+        impl.fast_forward_shown = {};
+    });
 }
 
 void VulkanRenderer::pause_interpolation() {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_) return;
     // The game stands still: the presents it had scheduled are dropped and
     // the frames' moments start over when it resumes.
@@ -8577,6 +9167,7 @@ void VulkanRenderer::pause_interpolation() {
 }
 
 void VulkanRenderer::set_frame_rate(settings::FrameRate rate) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_) return;
     Impl &impl = *impl_;
     if (impl.frame_rate == rate) return;
@@ -8590,8 +9181,8 @@ void VulkanRenderer::set_frame_rate(settings::FrameRate rate) {
 bool VulkanRenderer::can_skip_frames() const {
     // Limit to 30 fps skips every other frame whatever Frame skip says.
     const settings::Settings &s = settings::current();
-    return impl_ && impl_->ready && (s.frame_skip || s.half_rate) && !impl_->fast_forward &&
-           (s.half_rate || !impl_->interpolation_wanted());
+    return impl_ && impl_->ready && (s.frame_skip || s.half_rate) && !impl_->guest_fast_forward &&
+           (s.half_rate || !impl_->interpolating_now.load());
 }
 
 bool VulkanRenderer::redrawn_every_frame(std::uint32_t address) const {
@@ -8599,13 +9190,12 @@ bool VulkanRenderer::redrawn_every_frame(std::uint32_t address) const {
     // The buffers the game shows are drawn every frame between them: a game
     // that double-buffers draws each one every other frame. So is anything
     // drawn in either of the last two frames.
-    if (impl_->shows(address)) return true;
+    if (impl_->guest_shows(address)) return true;
     // An address drawn as part of another target is redrawn as that one is.
     if (const auto alias = impl_->target_aliases.find(address); alias != impl_->target_aliases.end())
         address = alias->second.base;
-    const auto found = impl_->targets.find(address);
-    return found != impl_->targets.end() && found->second.initialized &&
-           found->second.last_drawn_frame + 2u >= impl_->frames;
+    const auto found = impl_->guest_targets.find(address);
+    return found != impl_->guest_targets.end() && found->second.last_drawn_frame + 2u >= impl_->guest_frames;
 }
 
 void VulkanRenderer::skip_flip() {
@@ -8613,18 +9203,20 @@ void VulkanRenderer::skip_flip() {
     // The window keeps the frame shown last: the buffer the game flipped to
     // holds a picture two frames old. Draws into buffers drawn only now and
     // then were made, and stay recorded for the next flip.
-    impl_->ui_draw_data = nullptr;
+    Impl &impl = *impl_;
+    impl.on_render([&impl] { impl.ui_draw_data = nullptr; });
     perf::count_skipped_frame();
 }
 
 void VulkanRenderer::set_frame_rate_auto(bool automatic) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     if (!impl_) return;
     impl_->governor.set_automatic(automatic);
     if (impl_->frame_rate != settings::FrameRate::Fps30)
         perf::set_frame_rate_info(impl_->governor.rate(), impl_->governor.requested());
 }
 
-float VulkanRenderer::display_refresh() const noexcept { return impl_ ? impl_->display_hz : 0.0f; }
+float VulkanRenderer::display_refresh() const noexcept { return impl_ ? impl_->display_hz.load() : 0.0f; }
 
 double VulkanRenderer::frame_rate_now() const noexcept {
     if (!impl_ || impl_->frame_rate == settings::FrameRate::Fps30) return pacing::game_rate();
@@ -8632,6 +9224,7 @@ double VulkanRenderer::frame_rate_now() const noexcept {
 }
 
 bool VulkanRenderer::capture_frame(const std::string &path) {
+    if (impl_) impl_->sync();  // the render thread's state, touched here
     Impl &impl = *impl_;
     if (!impl.ready) return false;
     vkDeviceWaitIdle(impl.device);
@@ -8709,6 +9302,7 @@ bool VulkanRenderer::capture_frame(const std::string &path) {
 }
 
 void VulkanRenderer::shutdown() {
+    if (impl_) impl_->stop_render_thread();
     if (impl_ && impl_->gamepad != nullptr) {
         SDL_CloseGamepad(impl_->gamepad);
         impl_->gamepad = nullptr;
@@ -8825,7 +9419,7 @@ void VulkanRenderer::shutdown() {
     if (impl.surface != VK_NULL_HANDLE) vkDestroySurfaceKHR(impl.instance, impl.surface, nullptr);
     vkDestroyInstance(impl.instance, nullptr);
     if (impl.window != nullptr) SDL_DestroyWindow(impl.window);
-    impl = Impl{};
+    impl_ = std::make_unique<Impl>();
 }
 
 } // namespace portablekit::gpu

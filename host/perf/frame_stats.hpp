@@ -33,6 +33,12 @@ struct Options {
 // Render includes the GPU waits that happen inside it; the summary subtracts
 // those, and only those, from it.
 void add_render_time(Clock::duration duration);
+// The renderer's own thread (gpu/vulkan_renderer.cpp, <prefix>_RENDER_THREAD)
+// marks itself once: its GPU waits then count towards its own time, not the
+// game thread's "wait". Its busy time is added with add_render_thread_time()
+// and shown as "rthread" on the perf line.
+void mark_render_thread();
+void add_render_thread_time(Clock::duration duration);
 
 // Where the render thread stops, for <prefix>_TRACE_STALLS. The waits count
 // towards "wait"; the copies are CPU work inside "render" that reads memory
@@ -127,6 +133,8 @@ struct Summary {
     double wait_ms{};
     double pacing_ms{};       // of wait: holding the game to real time, when it had nothing to do
     double overlay_ms{};
+    double render_thread_ms{};       // the render thread's work per frame, its GPU waits left out
+    double render_thread_wait_ms{};  // its GPU waits per frame
     double frame_rate{};      // frame interpolation's rate now and the setting's, 0 when off
     double requested_rate{};
     // GPU time per frame from timestamp queries, when the device has them.
@@ -140,7 +148,8 @@ struct Summary {
     double vertex_mib{};      // the most one frame took of the vertex buffer, 0 when unknown
     double index_mib{};
 };
-[[nodiscard]] const Summary &last_second();
+// A copy: the render thread reads it while the game's thread makes the next.
+[[nodiscard]] Summary last_second();
 
 // <prefix>_PERF_ALTERNATE=name[,name...]: the named new renderer paths are
 // turned off every other second, so one run measures them against the paths

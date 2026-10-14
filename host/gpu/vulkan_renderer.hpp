@@ -287,6 +287,14 @@ public:
 
 private:
     struct Impl;
+    // What a draw needs from guest memory, found by submit() on the thread
+    // that runs the display lists; draw() does the rest.
+    struct GuestDraw;
+    void draw(const DrawCall &call, const GuestDraw &guest, const GuestMemory *memory);
+    // present() and upload_frame() on the thread that records.
+    bool present_frame(std::uint32_t display_address, std::optional<std::chrono::steady_clock::time_point> moment);
+    void upload_frame_now(std::uint32_t display_address, const std::uint8_t *pixels, std::uint32_t width,
+                          std::uint32_t height, std::uint32_t stride);
     std::unique_ptr<Impl> impl_;
 };
 

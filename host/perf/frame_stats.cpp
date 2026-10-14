@@ -13,9 +13,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 
 namespace portablekit::perf {
 namespace {
+
+// The renderer's own thread, when it has one, counts here too: every change to
+// the statistics holds this lock. Its time is kept apart from the game
+// thread's guest/render/wait split, which is the game thread's own.
+std::mutex &lock() {
+    static std::mutex value;
+    return value;
+}
+thread_local bool tls_render_thread = false;
 
 double to_ms(Clock::duration duration) {
     return std::chrono::duration<double, std::milli>(duration).count();
@@ -90,6 +100,8 @@ struct State {
     Clock::duration wait{};
     Clock::duration pacing{};
     Clock::duration overlay{};
+    Clock::duration render_thread{};       // the render thread's work
+    Clock::duration render_thread_wait{};  // of it, blocked on the GPU
     std::uint32_t lists{};
     std::uint32_t draws{};
     Clock::time_point last_present{Clock::now()};
@@ -113,6 +125,8 @@ struct State {
     Clock::duration wait_sum{};
     Clock::duration pacing_sum{};
     Clock::duration overlay_sum{};
+    Clock::duration render_thread_sum{};
+    Clock::duration render_thread_wait_sum{};
     std::uint32_t list_sum{};
     std::uint64_t draw_sum{};
     std::uint64_t recorded_draw_sum{};
@@ -177,6 +191,9 @@ void print(const Summary &s) {
         length += std::snprintf(line + length, sizeof(line) - length, " | skipped %.0f/s", s.skipped);
     if (s.overlay_ms > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
         length += std::snprintf(line + length, sizeof(line) - length, " | overlay %.2f ms", s.overlay_ms);
+    if (s.render_thread_ms > 0.0 && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
+        length += std::snprintf(line + length, sizeof(line) - length, " | rthread %.1f wait %.1f ms",
+                                s.render_thread_ms, s.render_thread_wait_ms);
     if (alternate().paths != 0u && length > 0 && static_cast<std::size_t>(length) < sizeof(line))
         std::snprintf(line + length, sizeof(line) - length, " | alt %s", alternate().off ? "off" : "on");
     // Flushed per line: the log is read while the game runs, often through a
@@ -243,11 +260,12 @@ Options options() {
 }
 
 void restart_measurement() {
+    const std::lock_guard guard(lock());
     State &s = state();
     const Clock::time_point now = Clock::now();
     s.frame_start = now;
     s.last_present = now;
-    s.render = s.wait = s.pacing = s.overlay = Clock::duration{};
+    s.render = s.wait = s.pacing = s.overlay = s.render_thread = s.render_thread_wait = Clock::duration{};
     s.lists = 0u;
     s.draws = s.recorded_draws = 0u;
     s.stalls = StallTallies{};
@@ -261,6 +279,7 @@ void restart_measurement() {
     s.present_sum_ms = 0.0;
     s.present_max_ms = 0.0;
     s.render_sum = s.wait_sum = s.pacing_sum = s.overlay_sum = Clock::duration{};
+    s.render_thread_sum = s.render_thread_wait_sum = Clock::duration{};
     s.list_sum = 0u;
     s.draw_sum = s.recorded_draw_sum = 0u;
     s.pass_sum = s.copy_sum = s.cleared_pass_sum = s.skipped_sum = 0u;
@@ -270,7 +289,17 @@ void restart_measurement() {
     s.gpu_frames = 0u;
 }
 
-void add_render_time(Clock::duration duration) { state().render += duration; }
+void add_render_time(Clock::duration duration) {
+    const std::lock_guard guard(lock());
+    state().render += duration;
+}
+
+void mark_render_thread() { tls_render_thread = true; }
+
+void add_render_thread_time(Clock::duration duration) {
+    const std::lock_guard guard(lock());
+    state().render_thread += duration;
+}
 
 namespace {
 
@@ -341,42 +370,80 @@ std::uint64_t split_ticks() noexcept {
 #endif
 }
 
-void add_split(Split kind, std::uint64_t ticks) noexcept { render_split().ticks[static_cast<std::size_t>(kind)] += ticks; }
+void add_split(Split kind, std::uint64_t ticks) noexcept {
+    const std::lock_guard guard(lock());
+    render_split().ticks[static_cast<std::size_t>(kind)] += ticks;
+}
 void add_wait_time(Clock::duration duration, Stall kind) {
+    const std::lock_guard guard(lock());
     State &s = state();
-    s.wait += duration;
+    // A wait on the render thread blocks that thread, not the game's.
+    if (tls_render_thread) s.render_thread_wait += duration;
+    else s.wait += duration;
     s.stalls[static_cast<std::size_t>(kind)].add(duration);
 }
 void note_stall(Stall kind, Clock::duration duration) {
+    const std::lock_guard guard(lock());
     state().stalls[static_cast<std::size_t>(kind)].add(duration);
 }
 void add_gpu_time(double milliseconds) {
+    const std::lock_guard guard(lock());
     State &s = state();
     s.gpu_ms += milliseconds;
     ++s.gpu_samples;
 }
-void set_gpu_time_unavailable() { state().gpu_unavailable = true; }
+void set_gpu_time_unavailable() {
+    const std::lock_guard guard(lock());
+    state().gpu_unavailable = true;
+}
 void add_pacing_time(Clock::duration duration) {
+    const std::lock_guard guard(lock());
     State &s = state();
     s.pacing += duration;
     s.stalls[static_cast<std::size_t>(Stall::Pacing)].add(duration);
 }
-void add_overlay_time(Clock::duration duration) { state().overlay += duration; }
-void count_display_list() { ++state().lists; }
-void count_draw() { ++state().draws; }
-void count_recorded_draws(std::uint32_t count) { state().recorded_draws += count; }
-void count_render_pass() { ++state().pass_sum; }
-void count_target_copy() { ++state().copy_sum; }
-void count_skipped_frame() { ++state().skipped_sum; }
-void count_cleared_pass() { ++state().cleared_pass_sum; }
+void add_overlay_time(Clock::duration duration) {
+    const std::lock_guard guard(lock());
+    state().overlay += duration;
+}
+void count_display_list() {
+    const std::lock_guard guard(lock());
+    ++state().lists;
+}
+void count_draw() {
+    const std::lock_guard guard(lock());
+    ++state().draws;
+}
+void count_recorded_draws(std::uint32_t count) {
+    const std::lock_guard guard(lock());
+    state().recorded_draws += count;
+}
+void count_render_pass() {
+    const std::lock_guard guard(lock());
+    ++state().pass_sum;
+}
+void count_target_copy() {
+    const std::lock_guard guard(lock());
+    ++state().copy_sum;
+}
+void count_skipped_frame() {
+    const std::lock_guard guard(lock());
+    ++state().skipped_sum;
+}
+void count_cleared_pass() {
+    const std::lock_guard guard(lock());
+    ++state().cleared_pass_sum;
+}
 
 void note_frame_space(std::uint64_t vertex_bytes, std::uint64_t index_bytes) {
+    const std::lock_guard guard(lock());
     State &s = state();
     s.vertex_peak = std::max(s.vertex_peak, vertex_bytes);
     s.index_peak = std::max(s.index_peak, index_bytes);
 }
 
 void set_display_info(const std::string &present_mode, std::uint32_t width, std::uint32_t height, float refresh_hz) {
+    const std::lock_guard guard(lock());
     State &s = state();
     s.present_mode = present_mode;
     s.width = width;
@@ -384,7 +451,8 @@ void set_display_info(const std::string &present_mode, std::uint32_t width, std:
     s.refresh_hz = refresh_hz;
 }
 
-void count_present() {
+namespace {
+void count_present_locked() {
     State &s = state();
     const Clock::time_point now = Clock::now();
     const double present_ms = to_ms(now - s.last_present);
@@ -395,16 +463,24 @@ void count_present() {
     s.present_sum_ms += present_ms;
     s.present_max_ms = std::max(s.present_max_ms, present_ms);
 }
+} // namespace
+
+void count_present() {
+    const std::lock_guard guard(lock());
+    count_present_locked();
+}
 
 void set_frame_rate_info(double rate, double requested) {
+    const std::lock_guard guard(lock());
     State &s = state();
     s.frame_rate = rate;
     s.requested_rate = requested;
 }
 
 void end_frame(std::uint64_t virtual_us, bool presented) {
+    const std::lock_guard guard(lock());
     State &s = state();
-    if (presented) count_present();
+    if (presented) count_present_locked();
     const Clock::time_point now = Clock::now();
     const double frame_ms = to_ms(now - s.frame_start);
     s.frame_start_previous = s.frame_start;
@@ -420,6 +496,8 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
     s.wait_sum += s.wait;
     s.pacing_sum += s.pacing;
     s.overlay_sum += s.overlay;
+    s.render_thread_sum += s.render_thread;
+    s.render_thread_wait_sum += s.render_thread_wait;
     s.list_sum += s.lists;
     s.draw_sum += s.draws;
     s.recorded_draw_sum += s.recorded_draws;
@@ -457,7 +535,7 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
         line += " |" + format_stalls(s.stalls, 1.0, false);
         std::cout << line << std::endl;
     }
-    s.render = s.wait = s.pacing = s.overlay = Clock::duration{};
+    s.render = s.wait = s.pacing = s.overlay = s.render_thread = s.render_thread_wait = Clock::duration{};
     s.lists = 0u;
     s.draws = s.recorded_draws = 0u;
     s.stalls = StallTallies{};
@@ -494,6 +572,8 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
     out.render_ms = std::max(0.0, to_ms(s.render_sum) / frames - gpu_wait_ms);
     out.guest_ms = std::max(0.0, s.frame_sum_ms / frames - out.render_ms - out.wait_ms);
     out.overlay_ms = to_ms(s.overlay_sum) / frames;
+    out.render_thread_wait_ms = to_ms(s.render_thread_wait_sum) / frames;
+    out.render_thread_ms = std::max(0.0, to_ms(s.render_thread_sum) / frames - out.render_thread_wait_ms);
     out.gpu_valid = !s.gpu_unavailable && s.gpu_frames != 0u;
     out.gpu_avg_ms = s.gpu_frames != 0u ? s.gpu_sum_ms / static_cast<double>(s.gpu_frames) : 0.0;
     out.gpu_max_ms = s.gpu_max_ms;
@@ -528,6 +608,7 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
     s.present_sum_ms = 0.0;
     s.present_max_ms = 0.0;
     s.render_sum = s.wait_sum = s.pacing_sum = s.overlay_sum = Clock::duration{};
+    s.render_thread_sum = s.render_thread_wait_sum = Clock::duration{};
     s.list_sum = 0u;
     s.draw_sum = s.recorded_draw_sum = 0u;
     s.pass_sum = s.copy_sum = s.cleared_pass_sum = s.skipped_sum = 0u;
@@ -537,7 +618,10 @@ void end_frame(std::uint64_t virtual_us, bool presented) {
     s.gpu_frames = 0u;
 }
 
-const Summary &last_second() { return state().summary; }
+Summary last_second() {
+    const std::lock_guard guard(lock());
+    return state().summary;
+}
 const std::array<float, kHistoryFrames> &frame_history() { return state().history; }
 std::size_t history_cursor() { return state().cursor; }
 
