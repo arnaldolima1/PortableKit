@@ -1264,6 +1264,55 @@ static void test_automatic_cross_unit_tail_chaining() {
 #endif
 }
 
+// --sparse-entries keeps the analyzed blocks but makes dispatcher entries only
+// where control arrives from outside a block; anywhere else the unit hands the
+// address to the interpreter instead of stopping.
+static void test_automatic_sparse_entries() {
+#ifndef PSPRECOMP_CODEGEN_PATH
+    throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
+#else
+    const auto root = std::filesystem::temp_directory_path() / "psprecomp_sparse_entries_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto read_unit = [](const std::filesystem::path &path) {
+        std::ifstream in(path);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const auto generate = [&](const std::string &name, const std::vector<std::uint8_t> &bytes) {
+        const auto elf_path = root / (name + ".elf");
+        { std::ofstream out(elf_path, std::ios::binary); out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size())); }
+        const auto generated_dir = root / name;
+        const std::string command = shell_quote(codegen_tool_path()) + " " + shell_quote(elf_path) +
+            " --auto " + shell_quote(generated_dir) + " 0x08804000 64 --sparse-entries";
+        require(std::system(shell_command(command).c_str()) == 0, "psp_recomp --sparse-entries failed");
+        return generated_dir;
+    };
+
+    // One function: entry, a branch, its fallthrough and its target. Only the
+    // entry is entered from outside; the other two are blocks reached by goto.
+    const auto branch_dir = generate("branch", make_branch_delay_test_elf());
+    const std::string text = read_unit(branch_dir / "generated_unit_0000.cpp");
+    require(text.find("runtime.register_function(0x08804000u") != std::string::npos,
+            "Sparse entries did not register the function entry");
+    require(text.find("runtime.register_function(0x0880400") == text.rfind("runtime.register_function(0x0880400"),
+            "Sparse entries registered more than the function entry");
+    require(text.find("L_0880400C:") != std::string::npos && text.find("L_08804010:") != std::string::npos,
+            "Sparse entries lost the branch's blocks");
+    require(text.find("L_08804008:") == std::string::npos,
+            "Sparse entries made a block of a delay slot");
+    require(text.find("rt.interpret(ctx)") != std::string::npos,
+            "Sparse entries do not interpret an address without an entry");
+
+    // A fixed branch into another unit still chains straight to its entry.
+    const auto cross_dir = generate("cross", make_cross_unit_branch_test_elf());
+    require(read_unit(cross_dir / "generated_unit_0000.cpp")
+                    .find("(void)rt.invoke_chained_direct<&recomp_unit_0001_entry, 1u, 1u, 0x08804040u>(ctx, &aot_mem); return;") !=
+                std::string::npos,
+            "Sparse entries did not make a cross-unit branch target an entry");
+    std::filesystem::remove_all(root);
+#endif
+}
+
 static std::vector<std::uint8_t> make_relocation_test_prx() {
     std::vector<std::uint8_t> bytes(0x1B8u, 0u);
     bytes[0] = 0x7Fu; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
@@ -2186,6 +2235,7 @@ int main() {
         test_vfpu_branch_cfg_discovery();
         test_automatic_cfg_and_codegen();
         test_automatic_cross_unit_tail_chaining();
+        test_automatic_sparse_entries();
         test_materialized_function_pointer_discovery();
 
         auto relocation_elf = psprecomp::Elf32Image::from_bytes(make_relocation_test_prx(), "synthetic_relocation.prx");

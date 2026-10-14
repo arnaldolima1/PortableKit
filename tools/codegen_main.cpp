@@ -1022,18 +1022,26 @@ struct GeneratedFunctionInput {
     std::string name;
     std::uint32_t address{};
     std::set<std::uint32_t> instructions;
+    // Where blocks start: every goto target. Also the dispatcher's entries
+    // unless dispatch_entries is given.
     std::set<std::uint32_t> entry_labels;
     std::uint32_t executable_base{};
     std::uint32_t unit_span_bytes{};
     const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids{};
     const std::set<std::uint32_t> *import_stubs{};
     const std::set<std::uint32_t> *unit_indices{};
+    // Sparse entries: the addresses the unit can be entered at, a subset of
+    // entry_labels. Entered anywhere else, the unit interprets the guest code
+    // up to the next registered address instead of stopping.
+    const std::set<std::uint32_t> *dispatch_entries{};
 };
 
 std::string emit_function_source(const GeneratedFunctionInput &function,
                                  const psprecomp::GuestMemory &memory,
                                  const std::string &cpp_name) {
     std::ostringstream body;
+    const bool sparse = function.dispatch_entries != nullptr;
+    const std::set<std::uint32_t> &entries = sparse ? *function.dispatch_entries : function.entry_labels;
 
     // Unit entry dispatch.  A `switch (ctx.pc)` over several hundred sparse
     // guest addresses compiles to a branch tree, and every outer dispatch pays
@@ -1043,19 +1051,19 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
     // The guarded offset/alignment test keeps the accepted PC set identical to
     // the exact comparisons it replaces.
     constexpr std::uint64_t kMaximumDenseSlots = 8192u;
-    const bool dense_dispatch = !function.entry_labels.empty() &&
-        (static_cast<std::uint64_t>(*function.entry_labels.rbegin() - *function.entry_labels.begin()) / 4u + 1u)
+    const bool dense_dispatch = !entries.empty() &&
+        (static_cast<std::uint64_t>(*entries.rbegin() - *entries.begin()) / 4u + 1u)
             <= kMaximumDenseSlots;
-    const std::uint32_t dense_base = function.entry_labels.empty() ? 0u : *function.entry_labels.begin();
-    const std::uint32_t dense_span = function.entry_labels.empty()
+    const std::uint32_t dense_base = entries.empty() ? 0u : *entries.begin();
+    const std::uint32_t dense_span = entries.empty()
         ? 0u
-        : (*function.entry_labels.rbegin() - dense_base) + 4u;
+        : (*entries.rbegin() - dense_base) + 4u;
     const std::string table_name = "kEntryIds_" + cpp_name;
 
     if (dense_dispatch) {
         std::map<std::uint32_t, std::uint32_t> id_by_label;
         std::uint32_t next_id = 1u;
-        for (const auto label : function.entry_labels) id_by_label[label] = next_id++;
+        for (const auto label : entries) id_by_label[label] = next_id++;
 
         body << "static const std::uint16_t " << table_name << "[" << (dense_span / 4u) << "] = {";
         for (std::uint32_t offset = 0u; offset < dense_span; offset += 4u) {
@@ -1078,12 +1086,21 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
              << "u && (entry_delta & 3u) == 0u) ? " << table_name << "[entry_delta >> 2u] : 0u;\n"
              << "    }\n"
              << "    switch (entry_id) {\n";
-        for (const auto label : function.entry_labels) {
+        for (const auto label : entries) {
             body << "    case " << id_by_label[label] << "u: goto L_"
                  << psprecomp::hex32(label).substr(2) << ";\n";
         }
-        body << "    default:\n"
-             << "        if (local_transfers == 0u) rt.unsupported(ctx.pc, 0u, \"invalid internal function entry\");\n"
+        body << "    default:\n";
+        if (sparse) {
+            // Entered from outside at an address that is not an entry: run it
+            // in the interpreter, which stops at the next registered address.
+            body << "        if (local_transfers == 0u) {\n"
+                 << "            if (!rt.interpret(ctx)) rt.unsupported(ctx.pc, 0u, \"no entry here and no interpreter\");\n"
+                 << "        }\n";
+        } else {
+            body << "        if (local_transfers == 0u) rt.unsupported(ctx.pc, 0u, \"invalid internal function entry\");\n";
+        }
+        body
              // Local transfers advance local_pc without touching AllegrexContext.
              // Leaving the unit through this default arm hands control back to the
              // outer dispatcher, for which ctx.pc is the only statement of where to
@@ -1102,12 +1119,21 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
              << "    std::uint32_t local_transfers = 0u;\n"
              << "LOCAL_DISPATCH:\n"
              << "    switch (ctx.pc) {\n";
-        for (const auto label : function.entry_labels) {
+        for (const auto label : entries) {
             body << "    case " << psprecomp::hex32(label) << "u: goto L_"
                  << psprecomp::hex32(label).substr(2) << ";\n";
         }
-        body << "    default:\n"
-             << "        if (local_transfers == 0u) rt.unsupported(ctx.pc, 0u, \"invalid internal function entry\");\n"
+        body << "    default:\n";
+        if (sparse) {
+            // Entered from outside at an address that is not an entry: run it
+            // in the interpreter, which stops at the next registered address.
+            body << "        if (local_transfers == 0u) {\n"
+                 << "            if (!rt.interpret(ctx)) rt.unsupported(ctx.pc, 0u, \"no entry here and no interpreter\");\n"
+                 << "        }\n";
+        } else {
+            body << "        if (local_transfers == 0u) rt.unsupported(ctx.pc, 0u, \"invalid internal function entry\");\n";
+        }
+        body
              // Local transfers advance local_pc without touching AllegrexContext.
              // Leaving the unit through this default arm hands control back to the
              // outer dispatcher, for which ctx.pc is the only statement of where to
@@ -1600,7 +1626,8 @@ int generate_auto(const std::filesystem::path &elf_path,
                   std::uint32_t load_base,
                   std::uint32_t unit_span_bytes,
                   bool chain_units = true,
-                  const std::vector<psprecomp::ExecutableRange> &extra_code_ranges = {}) {
+                  const std::vector<psprecomp::ExecutableRange> &extra_code_ranges = {},
+                  bool sparse_entries = false) {
     const auto started = std::chrono::steady_clock::now();
     // Progress goes to stderr and is flushed per line so `tail -f` on a log
     // shows how far a long generation has advanced.
@@ -1634,11 +1661,69 @@ int generate_auto(const std::filesystem::path &elf_path,
     for (const auto &range : program.executable_ranges) {
         for (std::uint32_t pc = range.start; pc + 4u <= range.end; pc += 4u) emitted_pcs.insert(pc);
     }
-    const std::set<std::uint32_t> &global_entries = emitted_pcs;
+
+    // With every word an entry, every instruction is a block the dispatcher
+    // can enter, and the C++ compiler has to keep the whole guest state in
+    // memory between any two of them. Sparse entries (--sparse-entries) keep
+    // the blocks the analysis found, and make entries only of the addresses
+    // control reaches from outside a block: functions and other code pointers
+    // the analysis seeded from, call continuations (returns land there), the
+    // targets of fixed jumps from another unit, the first word of each unit
+    // (straight-line code runs on into it), and every word the analysis never
+    // reached, as before. Entering a unit anywhere else, through a computed
+    // jump the analysis did not resolve, interprets up to the next entry.
+    std::set<std::uint32_t> sparse_labels;
+    std::set<std::uint32_t> sparse_entry_set;
+    if (sparse_entries) {
+        const auto unit_of = [&](std::uint32_t pc) { return (pc - executable_base) / unit_span_bytes; };
+        std::set<std::uint32_t> delay_slots;
+        for (const auto pc : program.covered_labels) {
+            if (psprecomp::decode_allegrex(memory.load32(pc)).has_delay_slot()) delay_slots.insert(pc + 4u);
+        }
+        const auto enter = [&](std::uint32_t pc) {
+            if (emitted_pcs.contains(pc)) { sparse_labels.insert(pc); sparse_entry_set.insert(pc); }
+        };
+        // A fixed transfer within one unit needs only a label; from another
+        // unit it arrives through the dispatcher.
+        const auto reach = [&](std::uint32_t from, std::uint32_t pc) {
+            if (!emitted_pcs.contains(pc)) return;
+            sparse_labels.insert(pc);
+            if (unit_of(pc) != unit_of(from)) sparse_entry_set.insert(pc);
+        };
+        for (const auto pc : program.covered_entry_labels) {
+            if (emitted_pcs.contains(pc)) sparse_labels.insert(pc);
+        }
+        for (const auto &[seed, source] : program.seeds) {
+            (void)source;
+            enter(seed);
+        }
+        for (const auto pc : emitted_pcs) {
+            if (!emitted_pcs.contains(pc - 4u) || unit_of(pc) != unit_of(pc - 4u)) enter(pc);
+            if (!program.covered_labels.contains(pc) && !delay_slots.contains(pc)) enter(pc);
+            const auto decoded = psprecomp::decode_allegrex(memory.load32(pc));
+            if (is_branch(decoded.kind)) {
+                reach(pc, pc + 4u + static_cast<std::uint32_t>(static_cast<std::int32_t>(decoded.immediate) * 4));
+                reach(pc, pc + 8u);
+                if (is_link_branch(decoded.kind)) enter(pc + 8u);
+            } else if (decoded.kind == psprecomp::OpcodeKind::J) {
+                reach(pc, ((pc + 4u) & 0xF0000000u) | (decoded.target << 2u));
+            } else if (decoded.kind == psprecomp::OpcodeKind::Jal) {
+                enter(((pc + 4u) & 0xF0000000u) | (decoded.target << 2u));
+                enter(pc + 8u);
+            } else if (decoded.kind == psprecomp::OpcodeKind::Jalr) {
+                enter(pc + 8u);
+            }
+        }
+        progress("sparse entries: " + std::to_string(sparse_entry_set.size()) + " entries, " +
+                 std::to_string(sparse_labels.size()) + " blocks, " + std::to_string(emitted_pcs.size()) + " words");
+    }
+    const std::set<std::uint32_t> &global_labels = sparse_entries ? sparse_labels : emitted_pcs;
+    const std::set<std::uint32_t> &global_entries = sparse_entries ? sparse_entry_set : emitted_pcs;
 
     struct Unit {
         std::uint32_t bucket{};
         std::set<std::uint32_t> instructions;
+        std::set<std::uint32_t> labels;
         std::set<std::uint32_t> entries;
     };
     std::map<std::uint32_t, Unit> units_by_bucket;
@@ -1652,6 +1737,11 @@ int generate_auto(const std::filesystem::path &elf_path,
         const std::uint32_t bucket = (entry - executable_base) / unit_span_bytes;
         auto it = units_by_bucket.find(bucket);
         if (it != units_by_bucket.end() && it->second.instructions.contains(entry)) it->second.entries.insert(entry);
+    }
+    for (const auto label : global_labels) {
+        const std::uint32_t bucket = (label - executable_base) / unit_span_bytes;
+        auto it = units_by_bucket.find(bucket);
+        if (it != units_by_bucket.end() && it->second.instructions.contains(label)) it->second.labels.insert(label);
     }
 
     std::vector<Unit> units;
@@ -1704,17 +1794,19 @@ int generate_auto(const std::filesystem::path &elf_path,
             generated_unit_cpp_name(unit.bucket),
             executable_base + unit.bucket * unit_span_bytes,
             unit.instructions,
-            unit.entries,
+            unit.labels,
             executable_base,
             chain_units ? unit_span_bytes : 0u,
             chain_units ? &direct_entry_ids : nullptr,
             &import_stubs,
             chain_units ? &unit_indices : nullptr,
+            sparse_entries ? &unit.entries : nullptr,
         };
 
         progress("unit " + std::to_string(unit_number) + "/" + std::to_string(units.size()) + " " +
                  path.filename().string() + ": " + std::to_string(unit.instructions.size()) +
-                 " instructions, " + std::to_string(unit.entries.size()) + " entries");
+                 " instructions, " + std::to_string(unit.labels.size()) + " blocks, " +
+                 std::to_string(unit.entries.size()) + " entries");
         std::ostringstream out;
         out << "#include \"psprecomp/corpus_abi.hpp\"\n#include \"" << units_header_name << "\"\n#include <atomic>\n#include <bit>\n#include <cmath>\n#include <cstdint>\n#include <limits>\n\nnamespace psprecomp {\n";
         // The register-cache lowering passes (per-basic-block GPR/FPR caches and
@@ -1798,6 +1890,7 @@ int generate_auto(const std::filesystem::path &elf_path,
            << "  \"discovered_function_seeds\": " << program.seeds.size() << ",\n"
            << "  \"unique_emitted_instructions\": " << program.covered_labels.size() << ",\n"
            << "  \"unique_registered_block_entries\": " << registered_entries << ",\n"
+           << "  \"sparse_entries\": " << (sparse_entries ? "true" : "false") << ",\n"
            << "  \"translation_units\": " << units.size() << ",\n"
            << "  \"rewritten_translation_units\": " << rewritten_units << ",\n"
            << "  \"registry_rewritten\": " << (registry_rewritten ? "true" : "false") << ",\n"
@@ -1824,8 +1917,15 @@ int main(int argc, char **argv) {
         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
             std::vector<std::string> positional;
             std::vector<psprecomp::ExecutableRange> extra_code;
+            bool sparse_entries = false;
             for (int i = 4; i < argc; ++i) {
                 const std::string_view option(argv[i]);
+                // Dispatcher entries only where control can arrive from
+                // outside a block (see generate_auto), not at every word.
+                if (option == "--sparse-entries") {
+                    sparse_entries = true;
+                    continue;
+                }
                 // A prefixed corpus (an overlay) gets its own symbol names and
                 // stays out of the main executable's fast unit table.
                 if (option == "--prefix" && i + 1 < argc) {
@@ -1852,17 +1952,18 @@ int main(int argc, char **argv) {
                 : 0x4000u;
             if (positional.size() > 2u) {
                 std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
-                          << " [--prefix <symbol_prefix>] [--code START-END ...]\n";
+                          << " [--prefix <symbol_prefix>] [--code START-END ...] [--sparse-entries]\n";
                 return 2;
             }
             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
-            return generate_auto(argv[1], argv[3], load_base, unit_span, g_symbol_prefix == "recomp", extra_code);
+            return generate_auto(argv[1], argv[3], load_base, unit_span, g_symbol_prefix == "recomp", extra_code,
+                                 sparse_entries);
         }
         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
         std::cerr << "Usage:\n"
                   << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
                   << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
-                  << " [--prefix <symbol_prefix>] [--code START-END ...]\n";
+                  << " [--prefix <symbol_prefix>] [--code START-END ...] [--sparse-entries]\n";
         return 2;
     } catch (const std::exception &e) {
         std::cerr << "psp_recomp error: " << e.what() << "\n";
