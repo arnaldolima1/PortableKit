@@ -102,6 +102,10 @@ struct MpegState {
     // (the GE's colour formats: 0 5650, 1 5551, 2 4444, 3 8888).
     std::uint32_t default_frame_width{};
     std::uint32_t pixel_mode{3u};
+    // The player pressed START to skip the movie: from then on the ring is
+    // emptied as the game fills it and the stream calls report no data, so
+    // the game's own player runs to the end of the file and finishes.
+    bool skipping{};
 };
 
 struct MpegModule {
@@ -119,6 +123,53 @@ MpegModule &module() {
 MpegState *find_mpeg(std::uint32_t address) {
     const auto found = module().instances.find(address);
     return found != module().instances.end() ? found->second.get() : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Skipping a movie
+
+constexpr std::uint32_t kStartButton = 0x0008u;
+// Pictures a movie shows before START skips it, half a second at 30 a
+// second: the press that started the movie must not end it.
+constexpr std::uint64_t kSkipAfterPictures = 15u;
+
+// GameProfile::start_skips_movies; <prefix>_NO_MOVIE_SKIP turns it off.
+bool movie_skip_allowed() {
+    static const bool allowed =
+        portablekit::game().start_skips_movies && portablekit::env("NO_MOVIE_SKIP") == nullptr;
+    return allowed;
+}
+
+// Starts skipping `state`'s movie when START has gone down since the last
+// look. Called once a movie frame, from the stream calls.
+void check_skip(MpegState &state) {
+    static bool start_was_down = true;
+    if (state.skipping || !movie_skip_allowed()) return;
+    const bool down = (host_pad_buttons() & kStartButton) != 0u;
+    const bool pressed = down && !start_was_down;
+    start_was_down = down;
+    if (!pressed || state.pictures < kSkipAfterPictures) return;
+    state.skipping = true;
+    std::cout << "[mpeg] START pressed: skipping the movie after " << state.pictures << " pictures" << std::endl;
+}
+
+bool ring_skipping(std::uint32_t ringbuffer) {
+    for (const auto &[address, state] : module().instances)
+        if (state->skipping && state->ringbuffer == ringbuffer) return true;
+    return false;
+}
+
+// Throws away what is in a skipped movie's ring, as if demultiplexed.
+void drain_skipped(psprecomp::GuestMemory &memory, MpegState &state) {
+    state.demuxer.reset();
+    state.video_unit.reset();
+    state.audio_unit.reset();
+    const std::uint32_t buffer = state.ringbuffer;
+    if (buffer == 0u) return;
+    const std::uint32_t filled = memory.load32(buffer + ring::kFilled);
+    state.packets_demuxed += filled;
+    memory.store32(buffer + ring::kRead, memory.load32(buffer + ring::kWritten));
+    memory.store32(buffer + ring::kFilled, 0u);
 }
 
 void finish_traced(AllegrexContext &ctx, const char *name, std::uint32_t result, const std::string &details = {},
@@ -220,7 +271,9 @@ void ringbuffer_put(AllegrexContext &ctx, std::uint32_t buffer, std::uint32_t re
                             const std::uint32_t packets = memory.load32(buffer + ring::kPackets);
                             const std::uint32_t written = memory.load32(buffer + ring::kWritten);
                             memory.store32(buffer + ring::kWritten, (written + count) % packets);
-                            memory.store32(buffer + ring::kFilled, memory.load32(buffer + ring::kFilled) + count);
+                            // A skipped movie's packets are dropped as they come.
+                            if (ring_skipping(buffer)) memory.store32(buffer + ring::kRead, (written + count) % packets);
+                            else memory.store32(buffer + ring::kFilled, memory.load32(buffer + ring::kFilled) + count);
                             // A short read is the end of the file: do not ask again.
                             if (count == chunk && requested > chunk) {
                                 ringbuffer_put(ctx, buffer, requested - chunk, total + count);
@@ -392,7 +445,9 @@ void register_library(HleRegistrar &hle) {
             return;
         }
         auto &memory = rt.memory();
-        if (!demux_until(memory, *state, [state] { return state->demuxer.video_ready(); })) {
+        check_skip(*state);
+        if (state->skipping) drain_skipped(memory, *state);
+        if (state->skipping || !demux_until(memory, *state, [state] { return state->demuxer.video_ready(); })) {
             finish_traced(ctx, "sceMpegGetAvcAu", mpeg_error::kNoData);
             return;
         }
@@ -411,7 +466,8 @@ void register_library(HleRegistrar &hle) {
             return;
         }
         auto &memory = rt.memory();
-        if (!demux_until(memory, *state, [state] { return state->demuxer.audio_ready(); })) {
+        if (state->skipping) drain_skipped(memory, *state);
+        if (state->skipping || !demux_until(memory, *state, [state] { return state->demuxer.audio_ready(); })) {
             finish_traced(ctx, "sceMpegGetAtracAu", mpeg_error::kNoData);
             return;
         }

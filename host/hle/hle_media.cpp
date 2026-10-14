@@ -1266,6 +1266,16 @@ void show_cpu_picture_in_vram(Runtime &rt, std::uint32_t address, std::uint32_t 
 #endif
 }
 
+std::uint32_t host_pad_buttons() {
+#if defined(PORTABLEKIT_HAS_RENDERER)
+    if (!media().renderer || !media().renderer->available()) return 0u;
+    media().renderer->sample_pad();
+    return media().renderer->pad().buttons;
+#else
+    return 0u;
+#endif
+}
+
 void register_media(HleRegistrar &hle) {
     initialize_renderer();
     register_display_ctrl(hle);

@@ -80,6 +80,9 @@ void log_once(const std::string &key, const std::string &message);
 
 // A movie is being decoded: the game has a sceMpeg instance (hle_mpeg.cpp).
 [[nodiscard]] bool mpeg_active();
+// The pad's buttons as the player holds them now, in the PSP's bit layout,
+// whether or not the game reads them (hle_media.cpp). 0 without a renderer.
+[[nodiscard]] std::uint32_t host_pad_buttons();
 // The game has ad hoc networking initialised (hle_adhoc.cpp).
 [[nodiscard]] bool adhoc_networking_on();
 
