@@ -537,6 +537,7 @@ Settings defaults_for(Platform platform) {
     // Confirm where a console of the game's region has it: cross, the south
     // button, outside Japan; circle, the east button, in Japan.
     values.confirm_south = game().confirm_button == 1u;
+    values.volume = std::min(game().default_volume, 100u);
     // The game's keyboard first; a phone then turns the mouse off either way.
     if (const auto keyboard = game().keyboard_defaults) keyboard(values.bindings, values.mouse);
     if (platform == Platform::Android) {

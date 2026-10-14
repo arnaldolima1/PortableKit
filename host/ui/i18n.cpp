@@ -438,6 +438,16 @@ constexpr Entry kPortuguese[] = {
     {"Go back to the pack installed in the data folder, if any. The pack's own folder is left alone.",
      "Volta para o pacote instalado na pasta de dados, se houver. A pasta do pacote não é mexida."},
     {"Does not load", "Não carrega"},
+    {"Install an HD texture pack from a folder: the one that holds textures.ini, or one that holds it in "
+     "textures/{} or PSP/TEXTURES. It is checked first; the pack it replaces is kept.",
+     "Instala um pacote de texturas HD de uma pasta: a que contém o textures.ini, ou uma que o contenha em "
+     "textures/{} ou PSP/TEXTURES. Ele é verificado antes; o pacote substituído é guardado."},
+    {"Pick the pack's folder (the one that holds textures.ini, or one that holds it in PSP/TEXTURES/{}) in "
+     "Android's file picker. It is copied into the game's data folder and checked; the pack it replaces is kept.",
+     "Escolha a pasta do pacote (a que contém o textures.ini, ou uma que o contenha em PSP/TEXTURES/{}) no "
+     "seletor de arquivos do Android. Ele é copiado para a pasta de dados do jogo e verificado; o pacote "
+     "substituído é guardado."},
+    {"Looking for the pack…", "Procurando o pacote…"},
     {"Import: open the pack's folder, the one that holds textures.ini, or choose a folder that holds it, such as "
      "PPSSPP's PSP/TEXTURES. You can also drop the folder on the window.",
      "Importar: abra a pasta do pacote, a que contém o textures.ini, ou escolha uma pasta que a contenha, como a "

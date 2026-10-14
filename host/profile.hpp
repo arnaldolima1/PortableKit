@@ -334,6 +334,18 @@ struct GameProfile {
     std::uint32_t system_language = 0u;
     std::uint32_t confirm_button = 0u;
 
+    // --- Texture packs -------------------------------------------------------
+    // Disc ids of other releases whose texture packs fit this one: releases
+    // that carry the same textures, so a pack made for one keys the same.
+    // Their packs import and load as this release's own. Empty: only packs
+    // made for disc_id, or whose textures.ini lists it, are taken.
+    std::span<const char *const> texture_pack_releases = {};
+
+    // --- Audio ---------------------------------------------------------------
+    // The volume, in percent, a new player starts with, for a game mixed much
+    // louder than its neighbours. Their own setting replaces it.
+    std::uint32_t default_volume = 100u;
+
     // --- Text ----------------------------------------------------------------
     // Where the game caches the glyphs it has drawn. Null: a font changed while
     // the game runs applies to text the game has not drawn yet.
@@ -366,6 +378,10 @@ using PatchImageHook = void (*)(psprecomp::Runtime &, const psprecomp::Elf32Imag
 [[nodiscard]] ExtraHleHook active_register_extra_hle();
 [[nodiscard]] PatchImageHook active_patch_loaded_image();
 [[nodiscard]] std::span<const std::uint32_t> active_overlay_slots();
+
+// Whether a texture pack made for `disc_id` fits this game: its own disc id
+// or one of texture_pack_releases, whatever the case.
+[[nodiscard]] bool texture_pack_fits(std::string_view disc_id);
 
 // getenv("<env_prefix>_" + name), so host code names the variable without the
 // game's prefix: env("TRACE_GE") reads <prefix>_TRACE_GE in Yakumo.
