@@ -106,6 +106,7 @@ set(PORTABLEKIT_RENDERER_SOURCES
     host/ui/launcher.cpp
     host/ui/layer.cpp
     host/ui/menu.cpp
+    host/ui/save_chooser.cpp
     host/ui/save_screen.cpp
     host/ui/setup_screens.cpp
     host/ui/text_input.cpp

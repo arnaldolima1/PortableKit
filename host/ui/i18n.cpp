@@ -44,6 +44,13 @@ constexpr Entry kPortuguese[] = {
     {"Off", "Desligado"},
     {"Yes", "Sim"},
     {"No", "Não"},
+    // The game's save list (save_chooser.cpp).
+    {"Load", "Carregar"},
+    {"Save", "Salvar"},
+    {"Choose", "Escolher"},
+    {"New save data", "Novo save"},
+    {"Save over this save?", "Salvar por cima deste save?"},
+    {"Delete this save?", "Apagar este save?"},
     {"None", "Nenhum"},
     {"Default", "Padrão"},
     {"Type", "Digitar"},
