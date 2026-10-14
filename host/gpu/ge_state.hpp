@@ -346,6 +346,22 @@ private:
 
     std::vector<std::uint32_t> call_stack_;
     DrawCall call_;  // reused by draw_primitive for every draw
+    // Prims drawn in a row with nothing changed between them but the vertex
+    // and index pointers go to the sink as one draw: a game drawing a mesh as
+    // hundreds of small prims (God of War: Ghost of Sparta makes some 6500
+    // a frame, nine vertices each) cost the renderer's whole per-draw work
+    // each time. Triangles, strips and fans join as one indexed triangle list,
+    // in the order the renderer expands them in; unindexed sprites join as
+    // they are. <prefix>_NO_DRAW_BATCH sends every prim on its own.
+    DrawCall batch_;
+    bool batch_open_{};
+    bool batch_indexed_{};  // made into an indexed triangle list
+    bool batch_sprites_{};
+    std::uint64_t batch_serial_{};
+    std::uint64_t state_serial_{};  // moves with every command that changes how a prim draws
+    std::vector<std::uint16_t> batch_scratch_;
+    void send_draw(DrawCall &call);
+    void flush_batch();
     DrawSink draw_sink_;
     SkipDraw skip_draw_;
     SignalSink signal_sink_;

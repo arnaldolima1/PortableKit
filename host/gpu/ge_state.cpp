@@ -4,6 +4,8 @@
 #include "perf/frame_stats.hpp"
 #include "psprecomp/common.hpp"
 
+#include "triangle_indices.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -867,6 +869,8 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
                       << ") -> 0x" << std::hex << transfer.destination << std::dec << " (" << transfer.destination_x
                       << "," << transfer.destination_y << " row " << transfer.destination_stride << ") "
                       << transfer.width << "x" << transfer.height << " x" << transfer.bytes_per_pixel << " bytes\n";
+        // The prims before it are drawn first.
+        flush_batch();
         if (transfer_sink_) transfer_sink_(transfer);
         break;
     }
@@ -1167,7 +1171,57 @@ void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
 
     ++draw_count_;
     vertex_count_ += call.raw_vertices != nullptr ? call.raw_count : call.vertices.size();
-    if (draw_sink_) draw_sink_(call);
+    send_draw(call);
+}
+
+void GeState::send_draw(DrawCall &call) {
+    if (!draw_sink_) return;
+    static const bool off = portablekit::env("NO_DRAW_BATCH") != nullptr;
+    const bool triangles = call.primitive == PrimitiveType::Triangles ||
+                           call.primitive == PrimitiveType::TriangleStrip ||
+                           call.primitive == PrimitiveType::TriangleFan;
+    const bool sprites = call.primitive == PrimitiveType::Sprites && call.indices.empty();
+    const bool batchable = !off && call.raw_vertices == nullptr && !call.vertices.empty() && (triangles || sprites);
+    if (batch_open_) {
+        if (batchable && state_serial_ == batch_serial_ && sprites == batch_sprites_ &&
+            batch_.vertices.size() + call.vertices.size() <= 0xFFFFu) {
+            if (sprites) {
+                batch_.vertices.insert(batch_.vertices.end(), call.vertices.begin(), call.vertices.end());
+                return;
+            }
+            if (!batch_indexed_) {
+                const std::size_t count = batch_.indices.empty() ? batch_.vertices.size() : batch_.indices.size();
+                triangle_indices(batch_.primitive, count, batch_.indices, batch_.vertices.size(), batch_scratch_);
+                batch_.indices.swap(batch_scratch_);
+                batch_.primitive = PrimitiveType::Triangles;
+                batch_indexed_ = true;
+            }
+            const std::size_t count = call.indices.empty() ? call.vertices.size() : call.indices.size();
+            triangle_indices(call.primitive, count, call.indices, call.vertices.size(), batch_scratch_);
+            const auto base = static_cast<std::uint16_t>(batch_.vertices.size());
+            batch_.vertices.insert(batch_.vertices.end(), call.vertices.begin(), call.vertices.end());
+            for (const std::uint16_t index : batch_scratch_) batch_.indices.push_back(static_cast<std::uint16_t>(index + base));
+            return;
+        }
+        flush_batch();
+    }
+    if (!batchable) {
+        draw_sink_(call);
+        return;
+    }
+    // The prim opens a batch: its call becomes the batch, and the batch's old
+    // buffers go back to be decoded into.
+    std::swap(batch_, call);
+    batch_open_ = true;
+    batch_indexed_ = false;
+    batch_sprites_ = sprites;
+    batch_serial_ = state_serial_;
+}
+
+void GeState::flush_batch() {
+    if (!batch_open_) return;
+    batch_open_ = false;
+    if (draw_sink_) draw_sink_(batch_);
 }
 
 namespace {
@@ -1430,8 +1484,14 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
     if (dump) std::cerr << "[ge-list] run " << run << " from " << psprecomp::hex32(pc) << "\n";
 
     for (std::uint32_t steps = 0; steps < 2'000'000u; ++steps) {
-        if (stall != 0u && pc == stall) return pc;
-        if (!memory.contains(pc, 4u)) return pc;
+        if (stall != 0u && pc == stall) {
+            flush_batch();
+            return pc;
+        }
+        if (!memory.contains(pc, 4u)) {
+            flush_batch();
+            return pc;
+        }
         const std::uint32_t word = memory.load32(pc);
         if (dump && steps < list_trace_words)
             std::cerr << "[ge-list] " << psprecomp::hex32(pc) << " " << psprecomp::hex32(word) << "\n";
@@ -1467,6 +1527,7 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
             continue;
         case kEnd:
             finished = true;
+            flush_batch();
             return pc;
         case kFinish:
             if (signal_sink_) signal_sink_(0x10000u | (data & 0xFFFFu), pc);
@@ -1516,13 +1577,22 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
             continue;
         case kBezier:
         case kSpline:
+            flush_batch();
             draw_patch(memory, command, data);
             continue;
         default:
+            // Pointers and the bone matrices (applied as the vertices are
+            // decoded) leave a batch open; anything else may change how the
+            // next prim draws.
+            if (command != kVertexAddress && command != kIndexAddress && command != kBase &&
+                command != kOffsetAddress && command != kBoneMatrixNumber && command != kBoneMatrixData &&
+                command != 0x00u)
+                ++state_serial_;
             handle_command(memory, command, data);
             continue;
         }
     }
+    flush_batch();
     return pc;
 }
 
