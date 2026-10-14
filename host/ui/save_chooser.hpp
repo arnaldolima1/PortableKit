@@ -34,15 +34,20 @@ struct SaveChooserRequest {
     std::size_t focus{};          // the row focused when the list opens
 };
 
-// Called once when the list closes: the chosen save's name, or nullopt when
-// the player cancelled.
+// Called once, as soon as the player has chosen: the chosen save's name, or
+// nullopt when the player cancelled.
 using SaveChooserDone = std::function<void(std::optional<std::string>)>;
 
 // Opens the list over the running game. The game keeps running, as it does
 // behind the PSP's dialog, but reads a neutral pad, and the window keeps the
 // frame that was on screen. False when there is no interface to draw it in.
 bool open_game_save_chooser(SaveChooserRequest request, SaveChooserDone on_done);
+// Open from the moment it is shown until the result of the choice has been
+// shown too.
 [[nodiscard]] bool save_chooser_open();
+// How the save or delete the player chose went, to show before the list
+// closes.
+void save_chooser_report(bool ok);
 // Builds this frame of the list and handles its input. Call inside an
 // interface frame.
 void save_chooser_frame();

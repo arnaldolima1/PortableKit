@@ -543,6 +543,9 @@ void deliver_choice(psprecomp::GuestMemory &memory) {
     memory.store32(s.params + dialog_common::kResultOffset, outcome);
     if (outcome != result::kOk || trace_savedata())
         std::cerr << "[savedata] result " << psprecomp::hex32(outcome) << "\n";
+#if defined(PORTABLEKIT_HAS_RENDERER)
+    if (chosen) ui::save_chooser_report(outcome == result::kOk);
+#endif
     s.dialog.hold(false);
 }
 

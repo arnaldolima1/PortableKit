@@ -14,11 +14,13 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <string>
 #include <utility>
 
 namespace portablekit::ui {
@@ -58,6 +60,8 @@ Icon icon_for(const std::filesystem::path &path) {
     return icon;
 }
 
+using Clock = std::chrono::steady_clock;
+
 struct Chooser {
     bool open{};
     SaveChooserRequest request;
@@ -68,6 +72,14 @@ struct Chooser {
     // The save the question (save over it, delete it) is about.
     std::optional<std::size_t> asking;
     bool ask_focus{};
+    // After the choice the answer is given at once, and the panel says how it
+    // went until close_at; the frame stays held all the while, so the game
+    // has drawn its scene again by the time it shows. Without that, the
+    // first frames after the dialog showed the half-drawn screen the game
+    // leaves behind the PSP's dialog.
+    bool closing{};
+    std::string closing_text;  // empty: nothing to say (a cancel)
+    Clock::time_point close_at;
 };
 
 Chooser &chooser() {
@@ -75,17 +87,57 @@ Chooser &chooser() {
     return value;
 }
 
-void finish(std::optional<std::string> chosen) {
+// Gives the game back its pad and its frames.
+void close_now() {
     Chooser &c = chooser();
     if (!c.open) return;
     c.open = false;
+    c.closing = false;
     Layer &layer = Layer::get();
     layer.set_interactive(false);
     layer.renderer().set_game_input(true);
     layer.renderer().hold_frame(false);
+}
+
+// Answers the game, then shows how it went for a moment before closing.
+void finish(std::optional<std::string> chosen) {
+    Chooser &c = chooser();
+    if (!c.open || c.closing) return;
+    c.closing = true;
+    const Clock::time_point now = Clock::now();
+    if (!chosen) {
+        c.close_at = now + std::chrono::milliseconds(300);
+    } else if (c.request.mode == SaveChooserMode::Load) {
+        c.closing_text = tr("Loading…");
+        c.close_at = now + std::chrono::milliseconds(600);
+    } else {
+        // Until save_chooser_report() says how it went; a few seconds at
+        // most if it never does.
+        c.closing_text = tr(c.request.mode == SaveChooserMode::Save ? "Saving…" : "Deleting…");
+        c.close_at = now + std::chrono::seconds(5);
+    }
     SaveChooserDone done = std::move(c.on_done);
     c.on_done = nullptr;
     if (done) done(std::move(chosen));
+}
+
+// The panel while closing: one line, centred.
+void closing_frame(const Chooser &c) {
+    if (c.closing_text.empty()) return;
+    const ImGuiIO &io = ImGui::GetIO();
+    ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, io.DisplaySize, colors::kBackdrop);
+    ImGui::SetNextWindowPos({io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {px(36.0f), px(22.0f)});
+    ImGui::Begin("##savedata_result", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.3f);
+    ImGui::PushStyleColor(ImGuiCol_Text, colors::kAccentBright);
+    ImGui::TextUnformatted(c.closing_text.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+    ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 const char *title_of(SaveChooserMode mode) {
@@ -102,11 +154,22 @@ std::string shown_title(const SaveSlot &slot) {
     return slot.title.empty() ? slot.name : slot.title;
 }
 
-// One save: its icon, title, the start of its detail, and when it was saved.
+// "Slot 4" for DATA03: the number a save name ends in, counted from one.
+std::string slot_label(const std::string &name) {
+    std::size_t digits = name.size();
+    while (digits > 0u && name[digits - 1u] >= '0' && name[digits - 1u] <= '9') --digits;
+    if (digits == name.size() || name.size() - digits > 4u) return {};
+    return trf("Slot {}", {std::to_string(std::stoi(name.substr(digits)) + 1)});
+}
+
+// One save: its icon, title, detail, when it was saved and its slot.
 // True when activated.
 bool slot_row(std::size_t index, const SaveSlot &slot, const Icon &icon, bool focus_now) {
-    // The title, and room for the three lines a detail usually has.
-    const float height = std::round(font() * 4.8f);
+    // The title over the detail's lines (four at most), and never shorter
+    // than the icon wants.
+    const int lines = 1 + static_cast<int>(std::count(slot.detail.begin(), slot.detail.end(), '\n'));
+    const int detail_lines = slot.detail.empty() ? 0 : std::min(4, lines);
+    const float height = std::round(font() * std::max(4.0f, 1.9f + 1.25f * static_cast<float>(detail_lines)));
     const ImVec2 min = ImGui::GetCursorScreenPos();
     const float width = ImGui::GetContentRegionAvail().x;
     const ImVec2 max{min.x + width, min.y + height};
@@ -153,13 +216,17 @@ bool slot_row(std::size_t index, const SaveSlot &slot, const Icon &icon, bool fo
     draw->AddText({text_x, line}, focused ? colors::kAccentBright : colors::kText, title.c_str());
     ImGui::PopClipRect();
     if (!slot.date.empty()) draw->AddText({right - date_width, line}, colors::kTextDim, slot.date.c_str());
+    const std::string label = slot_label(slot.name);
+    const float label_width = label.empty() ? 0.0f : ImGui::CalcTextSize(label.c_str()).x;
+    if (!label.empty())
+        draw->AddText({right - label_width, line + font() * 1.25f}, focused ? colors::kAccent : colors::kTextDim,
+                      label.c_str());
     if (!slot.detail.empty()) {
-        ImGui::PushClipRect({text_x, min.y}, {right, max.y - pad}, true);
+        ImGui::PushClipRect({text_x, min.y}, {right - label_width - px(12.0f), max.y - pad}, true);
         draw->AddText(nullptr, 0.0f, {text_x, line + font() * 1.2f}, colors::kTextDim, slot.detail.c_str(), nullptr,
                       right - text_x);
         ImGui::PopClipRect();
     }
-    if (focused || hovered) Layer::get().set_description(slot.exists ? slot.name : "");
     return pressed;
 }
 
@@ -168,7 +235,10 @@ bool slot_row(std::size_t index, const SaveSlot &slot, const Icon &icon, bool fo
 bool open_game_save_chooser(SaveChooserRequest request, SaveChooserDone on_done) {
     Layer &layer = Layer::get();
     if (!layer.attached() || request.slots.empty()) return false;
-    if (chooser().open) finish(std::nullopt);
+    if (chooser().open) {
+        finish(std::nullopt);
+        close_now();
+    }
     Chooser &c = chooser();
     c = Chooser{};
     for (const SaveSlot &slot : request.slots) c.icons.push_back(slot.icon.empty() ? Icon{} : icon_for(slot.icon));
@@ -187,14 +257,34 @@ bool open_game_save_chooser(SaveChooserRequest request, SaveChooserDone on_done)
 
 bool save_chooser_open() { return chooser().open; }
 
+void save_chooser_report(bool ok) {
+    Chooser &c = chooser();
+    if (!c.open || !c.closing || c.request.mode == SaveChooserMode::Load || c.closing_text.empty()) return;
+    const bool save = c.request.mode == SaveChooserMode::Save;
+    c.closing_text = ok ? tr(save ? "Saved." : "Deleted.") : tr(save ? "Could not save." : "Could not delete.");
+    c.close_at = Clock::now() + std::chrono::milliseconds(ok ? 1200 : 2500);
+}
+
 void save_chooser_frame() {
     Chooser &c = chooser();
     if (!c.open) return;
     Layer &layer = Layer::get();
     // The menu does not open over the list.
     (void)layer.take_menu_toggle();
+    if (c.closing) {
+        (void)layer.take_back();
+        if (Clock::now() >= c.close_at) {
+            close_now();
+            return;
+        }
+        closing_frame(c);
+        return;
+    }
     const ImGuiKey cancel = layer.confirm_south() ? ImGuiKey_GamepadFaceRight : ImGuiKey_GamepadFaceDown;
-    const bool back = layer.take_back() || ImGui::IsKeyPressed(cancel, false);
+    // The game's own prompt is answered with a face button that may still be
+    // down when the list opens: the pad counts only once every face button
+    // has been let go, as for navigation.
+    const bool back = layer.take_back() || (layer.gamepad_armed() && ImGui::IsKeyPressed(cancel, false));
     const SaveChooserMode mode = c.request.mode;
 
     begin_panel("##savedata", title_of(mode), c.request.game_title, true);
@@ -214,6 +304,9 @@ void save_chooser_frame() {
         for (std::size_t i = 0; i < c.request.slots.size(); ++i)
             if (slot_row(i, c.request.slots[i], c.icons[i], c.refocus && i == c.request.focus)) chosen = i;
         c.refocus = false;
+        const auto saves = std::count_if(c.request.slots.begin(), c.request.slots.end(),
+                                         [](const SaveSlot &slot) { return slot.exists; });
+        layer.set_description(saves == 1 ? tr("1 save") : trf("{} saves", {std::to_string(saves)}));
     }
     begin_footer();
     hints({{Control::Confirm, "Choose"}, {Control::Back, c.asking ? "No" : "Cancel"}});
