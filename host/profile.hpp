@@ -316,6 +316,14 @@ struct GameProfile {
     // vblank, so the game flips at most once a vblank, as it can on a PSP.
     // <prefix>_FLIP_UNLIMITED turns it off.
     bool flips_wait_for_vblank = false;
+    // Whether the shown frame is copied back into guest VRAM every flip, for a
+    // game that reads its own picture with the CPU (a pause screen built from
+    // the last frame). False saves that copy for a game known not to.
+    bool frame_writeback = true;
+    // START skips a movie the game plays through sceMpeg, by ending its stream
+    // as if the file had run out; the game's own player then moves on. For a
+    // game whose movies cannot be skipped otherwise.
+    bool start_skips_movies = false;
 
     // --- Loading -------------------------------------------------------------
     // Fast loading (kernel/fast_loading.hpp) lets emulated time run ahead

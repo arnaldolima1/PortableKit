@@ -109,6 +109,23 @@ struct AlphaTestState {
     std::uint32_t mask{0xFFu};
 };
 
+// The stencil test. The PSP keeps the stencil in the framebuffer's alpha;
+// the renderer keeps it in a stencil buffer beside the depth buffer.
+// Functions as the GE numbers them (0 never, 1 always, 2 equal, 3 not equal,
+// 4 less, 5 less or equal, 6 greater, 7 greater or equal: the reference
+// compared with the buffer's value), operations too (0 keep, 1 zero,
+// 2 replace, 3 invert, 4 increment, 5 decrement).
+struct StencilState {
+    bool enabled{};
+    std::uint32_t function{1u};
+    std::uint32_t reference{};
+    std::uint32_t mask{0xFFu};
+    std::uint32_t fail{};        // when the stencil test fails
+    std::uint32_t depth_fail{};  // when it passes and the depth test fails
+    std::uint32_t pass{};        // when both pass
+    std::uint32_t write_mask{0xFFu};  // bits that may change: the GE's alpha mask register inverted
+};
+
 struct ViewportState {
     float x_scale{}, y_scale{}, z_scale{};
     float x_offset{}, y_offset{}, z_offset{};
@@ -166,6 +183,7 @@ struct DrawCall {
     BlendState blend;
     DepthState depth;
     AlphaTestState alpha_test;
+    StencilState stencil;
     ViewportState viewport;
     bool culling_enabled{};
     bool cull_clockwise{};
@@ -295,6 +313,7 @@ private:
     BlendState blend_{};
     DepthState depth_{};
     AlphaTestState alpha_test_{};
+    StencilState stencil_{};
     ViewportState viewport_{};
     bool culling_enabled_{};
     bool cull_clockwise_{};

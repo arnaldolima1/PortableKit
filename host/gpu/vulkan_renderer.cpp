@@ -51,6 +51,7 @@
 #include <string>
 #include <utility>
 #include <set>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -109,8 +110,11 @@ void report_frame_space_full(const char *what) {
 }
 constexpr std::size_t kMaxCachedTextures = 1024u;
 // Descriptor sets for sampling render targets as textures: two per target
-// (with its alpha, and with alpha forced to one for 5650 textures).
-constexpr std::size_t kMaxFramebufferTextureSets = 64u;
+// (with its alpha, and with alpha forced to one for 5650 textures), and two
+// per extract (framebuffer_extract()), of which there are at most
+// kMaxFramebufferExtracts: shadows and other effects, a few a frame.
+constexpr std::size_t kMaxFramebufferExtracts = 32u;
+constexpr std::size_t kMaxFramebufferTextureSets = 64u + 2u * kMaxFramebufferExtracts;
 // GPU timestamps: a pair around each command buffer a frame submits. A frame
 // normally submits one; each GE block transfer that reads a framebuffer back
 // splits it once more.
@@ -277,6 +281,16 @@ struct PipelineKey {
     // The raw vertex shader, which decodes the guest's vertex bytes, and its
     // check build (<prefix>_CHECK_GPU_DECODE).
     bool raw{};
+    // The stencil test (StencilState), all zero when it is off. A clear that
+    // clears the stencil is a test that always passes and replaces.
+    bool stencil{};
+    std::uint32_t stencil_function{};
+    std::uint32_t stencil_fail{};
+    std::uint32_t stencil_depth_fail{};
+    std::uint32_t stencil_pass{};
+    std::uint32_t stencil_reference{};
+    std::uint32_t stencil_compare_mask{};
+    std::uint32_t stencil_write_mask{};
 
     auto operator<=>(const PipelineKey &) const = default;
 };
@@ -329,6 +343,17 @@ VkBlendOp to_blend_op(std::uint32_t equation) {
     case 3u: return VK_BLEND_OP_MIN;
     case 4u: return VK_BLEND_OP_MAX;
     default: return VK_BLEND_OP_ADD;
+    }
+}
+
+VkStencilOp to_stencil_op(std::uint32_t operation) {
+    switch (operation) {
+    case 1u: return VK_STENCIL_OP_ZERO;
+    case 2u: return VK_STENCIL_OP_REPLACE;
+    case 3u: return VK_STENCIL_OP_INVERT;
+    case 4u: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+    case 5u: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+    default: return VK_STENCIL_OP_KEEP;
     }
 }
 
@@ -665,29 +690,38 @@ struct VulkanRenderer::Impl {
     VkSwapchainKHR swapchain{};
     VkFormat swapchain_format{VK_FORMAT_B8G8R8A8_UNORM};
     VkExtent2D swapchain_extent{};
-    // The depth buffer's format: 32-bit float where the device can render to
-    // it, which desktop GPUs all can; phones may offer only 24- or 16-bit.
+    // The depth buffer's format: 32-bit float with 8 bits of stencil where
+    // the device can render to it, else 24-bit with stencil; without stencil
+    // only when the device has neither (<prefix>_NO_STENCIL asks for that too).
+    // The stencil stands in for the one the PSP keeps in the framebuffer's
+    // alpha, which God of War: Ghost of Sparta masks its shadows with.
     VkFormat depth_format{VK_FORMAT_D32_SFLOAT};
+    [[nodiscard]] bool has_stencil() const {
+        return depth_format == VK_FORMAT_D24_UNORM_S8_UINT || depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }
     [[nodiscard]] VkImageAspectFlags depth_aspect() const {
-        return depth_format == VK_FORMAT_D24_UNORM_S8_UINT || depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT
-                   ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
-                   : VK_IMAGE_ASPECT_DEPTH_BIT;
+        return has_stencil() ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     }
     void choose_depth_format() {
-        const VkFormat candidates[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D24_UNORM_S8_UINT,
-                                       VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D16_UNORM,
-                                       VK_FORMAT_D32_SFLOAT_S8_UINT};
-        for (const VkFormat format : candidates) {
-            VkFormatProperties properties{};
-            vkGetPhysicalDeviceFormatProperties(physical_device, format, &properties);
-            if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0u) {
-                depth_format = format;
-                if (format != VK_FORMAT_D32_SFLOAT)
-                    std::cout << "[render] no 32-bit float depth buffer; using format " << static_cast<int>(format)
-                              << "\n";
-                return;
+        const bool stencil = portablekit::env("NO_STENCIL") == nullptr;
+        const VkFormat with_stencil[] = {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT};
+        const VkFormat without[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_X8_D24_UNORM_PACK32,
+                                    VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT};
+        const auto pick = [&](std::span<const VkFormat> candidates) {
+            for (const VkFormat format : candidates) {
+                VkFormatProperties properties{};
+                vkGetPhysicalDeviceFormatProperties(physical_device, format, &properties);
+                if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0u) {
+                    depth_format = format;
+                    return true;
+                }
             }
-        }
+            return false;
+        };
+        if (!(stencil && pick(with_stencil)) && !pick(without)) return;
+        if (depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT)
+            std::cout << "[render] depth buffer format " << static_cast<int>(depth_format)
+                      << (has_stencil() ? ", with stencil" : ", no stencil") << "\n";
     }
     // The part of the window the game and the overlay may use, in pixels:
     // the whole window, except on Android, where a display cutout or a
@@ -1116,6 +1150,10 @@ struct VulkanRenderer::Impl {
         // attachment holds nothing worth keeping: passes neither load nor store
         // it, which on a tiled GPU halves what each pass moves.
         bool depth_written{};
+        // A draw has tested the stencil here: clears of its alpha then clear
+        // the stencil too. Targets that never use it keep their passes
+        // without the depth and stencil attachment.
+        bool stencil_used{};
     };
     std::map<std::uint32_t, Target> targets;
     // Write-back of the displayed framebuffer to guest VRAM (write_back_frame):
@@ -2054,6 +2092,47 @@ struct VulkanRenderer::Impl {
     // `height` guest pixels of it from (source.x, source.y).
     VkDescriptorSet framebuffer_descriptor(const FramebufferTexture &source, std::uint32_t width,
                                            std::uint32_t height, bool opaque);
+    // A piece of a target copied into an image of its own, the texture's
+    // size, so the texture's edges are the image's: clamping and repeating
+    // then work on the texture as the GE does, where the target's copy would
+    // run on into whatever else the target holds. God of War: Ghost of Sparta
+    // projects 64x64 shadow maps, drawn side by side in one buffer, onto the
+    // floor with clamping; read from the whole target, each shadow spread far
+    // past its character as a dark sheet. Null when it cannot be made.
+    struct Extract {
+        VkImage image{};
+        VkDeviceMemory memory{};
+        VkImageView view{};
+        VkImageView opaque_view{};
+        std::array<VkDescriptorSet, 2> descriptors{};
+        VkExtent2D extent{};
+        bool valid{};  // holds a copy, in shader read layout
+        // What it holds: the target, as of which draw, from where.
+        const Target *target{};
+        std::uint64_t serial{};
+        VkOffset2D offset{};
+        std::uint64_t used_frame{~0ull};
+    };
+    std::vector<Extract> extracts;
+    // A framebuffer the game points at inside another's area, with the same
+    // row length and format: on the PSP the same memory, so the same target,
+    // drawn at an offset. God of War: Ghost of Sparta draws each character's
+    // shadow map at its own address 64 pixels apart in one buffer
+    // (0x04161800, 0x04161880, ...), blurs the row of them as one texture
+    // and projects each from its place; as separate targets the blur and the
+    // projections read empty or stale pixels. <prefix>_NO_TARGET_ALIASES
+    // keeps a target for every address, as before.
+    struct TargetAlias {
+        std::uint32_t base{};
+        std::uint32_t x{};
+        std::uint32_t y{};
+        std::uint64_t drawn_frame{~0ull};  // the frame this address was last drawn at
+    };
+    std::map<std::uint32_t, TargetAlias> target_aliases;
+    [[nodiscard]] std::optional<TargetAlias> alias_for(const RenderTarget &target);
+    VkDescriptorSet framebuffer_extract(const FramebufferTexture &source, std::uint32_t width, std::uint32_t height,
+                                        bool opaque);
+    void destroy_extracts();
     // <prefix>_TRACE_PASSES: every render pass and target copy, one line each.
     [[nodiscard]] std::uint32_t target_address(const Target &target) const;
     void snapshot_guest_words(const GuestMemory &memory, std::uint32_t address, Target &target);
@@ -2418,6 +2497,10 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
     attachments[1] = attachments[0];
     impl.choose_depth_format();
     attachments[1].format = impl.depth_format;
+    if (impl.has_stencil()) {
+        attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
     attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference color_reference{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
@@ -3818,7 +3901,8 @@ bool VulkanRenderer::Impl::create_target(Target &target, std::string &error) {
                       target.color_memory, target.color_view, VK_IMAGE_ASPECT_COLOR_BIT, error))
         return false;
     if (!create_image(target_extent.width, target_extent.height, depth_format,
-                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, target.depth, target.depth_memory,
+                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, target.depth,
+                      target.depth_memory,
                       target.depth_view, depth_aspect(), error))
         return false;
     const std::array<VkImageView, 2> views{target.color_view, target.depth_view};
@@ -3915,8 +3999,20 @@ void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overw
             transition(command_buffer, target->color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         }
-        transition(command_buffer, target->depth, VK_IMAGE_LAYOUT_UNDEFINED,
-                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, depth_aspect());
+        if (has_stencil()) {
+            // The stencil starts as zeros, as the PSP's alpha does.
+            transition(command_buffer, target->depth, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       depth_aspect());
+            const VkClearDepthStencilValue zero{0.0f, 0u};
+            const VkImageSubresourceRange range{depth_aspect(), 0u, 1u, 0u, 1u};
+            vkCmdClearDepthStencilImage(command_buffer, target->depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero,
+                                        1u, &range);
+            transition(command_buffer, target->depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, depth_aspect());
+        } else {
+            transition(command_buffer, target->depth, VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, depth_aspect());
+        }
         target->initialized = true;
     }
     if (writes_depth || (overwritten & 2u) != 0u) target->depth_written = true;
@@ -4649,6 +4745,17 @@ void VulkanRenderer::Impl::snapshot_guest_words(const GuestMemory &memory, std::
     ++target.snapshot_serial;
     if (!memory.contains(address, bytes)) return;
     target.guest_words.reserve(bytes / 256u + 1u);
+    // Straight from guest memory where it is contiguous: a checked load for
+    // each word showed in profiles on a phone once shadow maps and blur
+    // buffers inside one target took a snapshot each.
+    if (const std::uint8_t *words = memory.raw_pointer(address, bytes)) {
+        for (std::uint32_t offset = 0; offset + 4u <= bytes; offset += 256u) {
+            std::uint32_t word;
+            std::memcpy(&word, words + offset, sizeof(word));
+            target.guest_words.push_back(word);
+        }
+        return;
+    }
     for (std::uint32_t offset = 0; offset + 4u <= bytes; offset += 256u)
         target.guest_words.push_back(memory.load32(address + offset));
 }
@@ -4839,6 +4946,167 @@ VkDescriptorSet VulkanRenderer::Impl::framebuffer_descriptor(const FramebufferTe
     return target.copy_descriptors[opaque ? 1u : 0u];
 }
 
+VkDescriptorSet VulkanRenderer::Impl::framebuffer_extract(const FramebufferTexture &source, std::uint32_t width,
+                                                          std::uint32_t height, bool opaque) {
+    const perf::SplitScope split(perf::Split::Texture);
+    Target &target = *source.target;
+    const double scale_x = static_cast<double>(target_extent.width) / kPspWidth;
+    const double scale_y = static_cast<double>(target_extent.height) / kPspHeight;
+    const auto x0 = static_cast<std::int32_t>(std::floor(source.x * scale_x));
+    const auto y0 = static_cast<std::int32_t>(std::floor(source.y * scale_y));
+    const auto x1 = std::min(static_cast<std::int32_t>(std::ceil((source.x + width) * scale_x)),
+                             static_cast<std::int32_t>(target_extent.width));
+    const auto y1 = std::min(static_cast<std::int32_t>(std::ceil((source.y + height) * scale_y)),
+                             static_cast<std::int32_t>(target_extent.height));
+    if (x1 <= x0 || y1 <= y0) return VK_NULL_HANDLE;
+    const VkExtent2D extent{static_cast<std::uint32_t>(x1 - x0), static_cast<std::uint32_t>(y1 - y0)};
+    const VkOffset2D offset{x0, y0};
+    const auto same_size = [&](const Extract &e) {
+        return e.extent.width == extent.width && e.extent.height == extent.height;
+    };
+    for (Extract &e : extracts) {
+        if (e.valid && e.target == &target && e.serial == target.draw_serial && e.offset.x == offset.x &&
+            e.offset.y == offset.y && same_size(e)) {
+            e.used_frame = frames;
+            return e.descriptors[opaque ? 1u : 0u];
+        }
+    }
+    // One not used this frame: a recorded draw of this frame may still read
+    // one that is.
+    Extract *slot = nullptr;
+    for (Extract &e : extracts)
+        if (e.used_frame != frames && same_size(e)) {
+            slot = &e;
+            break;
+        }
+    if (slot == nullptr) {
+        if (extracts.size() >= kMaxFramebufferExtracts) return VK_NULL_HANDLE;
+        Extract made;
+        std::string error;
+        bool ok = create_image(extent.width, extent.height, VK_FORMAT_R8G8B8A8_UNORM,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, made.image, made.memory,
+                               made.view, VK_IMAGE_ASPECT_COLOR_BIT, error);
+        if (ok) {
+            // A 5650 texture has no alpha: the GE reads it as opaque.
+            VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            view_info.image = made.image;
+            view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+            view_info.components.a = VK_COMPONENT_SWIZZLE_ONE;
+            view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+            ok = vkCreateImageView(device, &view_info, nullptr, &made.opaque_view) == VK_SUCCESS;
+        }
+        for (std::size_t i = 0; ok && i < made.descriptors.size(); ++i) {
+            VkDescriptorSetAllocateInfo descriptor_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            descriptor_info.descriptorPool = descriptor_pool;
+            descriptor_info.descriptorSetCount = 1u;
+            descriptor_info.pSetLayouts = &descriptor_layout;
+            ok = vkAllocateDescriptorSets(device, &descriptor_info, &made.descriptors[i]) == VK_SUCCESS;
+            if (!ok) {
+                made.descriptors[i] = VK_NULL_HANDLE;
+                break;
+            }
+            // The texture sampler repeats, as for a texture in guest memory;
+            // the shader clamps the axes the game clamps.
+            VkDescriptorImageInfo image_info{texture_sampler(), i == 0u ? made.view : made.opaque_view,
+                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = made.descriptors[i];
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &image_info;
+            vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+        }
+        made.extent = extent;
+        static const bool trace = portablekit::env("TRACE_FB_TEXTURES") != nullptr;
+        if (trace)
+            std::cout << "[fbtex] frame " << frames << " extract " << extracts.size() << ": " << width << "x" << height
+                      << " at " << source.x << "," << source.y << " of 0x" << std::hex << target_address(target)
+                      << std::dec << "\n";
+        extracts.push_back(made);
+        if (!ok) {
+            std::cout << "[render] cannot copy out part of a render target: " << error << "\n";
+            destroy_extracts();
+            return VK_NULL_HANDLE;
+        }
+        slot = &extracts.back();
+    }
+    end_pass();
+    transition(command_buffer, target.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    transition(command_buffer, slot->image,
+               slot->valid ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    region.dstSubresource = region.srcSubresource;
+    region.srcOffset = {offset.x, offset.y, 0};
+    region.dstOffset = {0, 0, 0};
+    region.extent = {extent.width, extent.height, 1u};
+    vkCmdCopyImage(command_buffer, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot->image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
+    perf::count_target_copy();
+    transition(command_buffer, slot->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transition(command_buffer, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    slot->valid = true;
+    slot->target = &target;
+    slot->serial = target.draw_serial;
+    slot->offset = offset;
+    slot->used_frame = frames;
+    return slot->descriptors[opaque ? 1u : 0u];
+}
+
+std::optional<VulkanRenderer::Impl::TargetAlias> VulkanRenderer::Impl::alias_for(const RenderTarget &drawn) {
+    static const bool off = portablekit::env("NO_TARGET_ALIASES") != nullptr;
+    if (off) return std::nullopt;
+    const std::uint32_t address = drawn.color_address;
+    if (const auto known = target_aliases.find(address); known != target_aliases.end()) {
+        const auto base = targets.find(known->second.base);
+        if (base != targets.end() && base->second.stride == drawn.color_stride &&
+            base->second.format == drawn.color_format)
+            return known->second;
+        target_aliases.erase(known);
+    }
+    // A target of its own already: drawn there before any buffer around it.
+    if (targets.contains(address)) return std::nullopt;
+    const std::uint32_t bytes_per_pixel = framebuffer_bytes_per_pixel(drawn.color_format);
+    const std::uint32_t row = drawn.color_stride * bytes_per_pixel;
+    if (row == 0u) return std::nullopt;
+    // The nearest target below the address whose area holds it.
+    for (auto it = targets.lower_bound(address); it != targets.begin();) {
+        --it;
+        const auto &[base, target] = *it;
+        if (!target.initialized || target.stride != drawn.color_stride || target.format != drawn.color_format)
+            continue;
+        const std::uint32_t offset = address - base;
+        if (offset >= row * kPspHeight) break;
+        if (offset % bytes_per_pixel != 0u) return std::nullopt;
+        const TargetAlias alias{base, (offset % row) / bytes_per_pixel, offset / row};
+        if (alias.x >= kPspWidth || alias.y >= kPspHeight) return std::nullopt;
+        static const bool trace = portablekit::env("TRACE_FB_TEXTURES") != nullptr;
+        if (trace)
+            std::cout << "[fbtex] frame " << frames << " 0x" << std::hex << address << " is 0x" << base << std::dec
+                      << " at " << alias.x << "," << alias.y << "\n";
+        target_aliases[address] = alias;
+        return alias;
+    }
+    return std::nullopt;
+}
+
+void VulkanRenderer::Impl::destroy_extracts() {
+    for (Extract &e : extracts) {
+        for (VkDescriptorSet &descriptor : e.descriptors)
+            if (descriptor != VK_NULL_HANDLE) vkFreeDescriptorSets(device, descriptor_pool, 1u, &descriptor);
+        vkDestroyImageView(device, e.opaque_view, nullptr);
+        vkDestroyImageView(device, e.view, nullptr);
+        vkDestroyImage(device, e.image, nullptr);
+        vkFreeMemory(device, e.memory, nullptr);
+    }
+    extracts.clear();
+}
+
 void VulkanRenderer::Impl::load_pipeline_cache() {
     if (portablekit::env("NO_PIPELINE_CACHE") != nullptr) {
         std::cout << "[render] pipeline cache off (" << portablekit::env_name("NO_PIPELINE_CACHE") << ")\n";
@@ -4915,14 +5183,17 @@ void VulkanRenderer::Impl::save_pipeline_cache() {
 namespace {
 
 constexpr std::uint32_t kPipelineKeysMagic = 0x4B504B59u;  // "YKPK"
-constexpr std::uint32_t kPipelineKeysVersion = 1u;
-constexpr std::uint32_t kPipelineKeyWords = 12u;
+constexpr std::uint32_t kPipelineKeysVersion = 2u;
+constexpr std::uint32_t kPipelineKeyWords = 14u;
 constexpr std::uint32_t kMaxPipelineKeys = 4096u;
 
 std::array<std::uint32_t, kPipelineKeyWords> key_words(const PipelineKey &key) {
     return {key.blend ? 1u : 0u, key.source_factor,  key.destination_factor, key.equation,
             key.depth_test ? 1u : 0u, key.depth_write ? 1u : 0u, key.depth_function, key.cull ? 1u : 0u,
-            key.cull_clockwise ? 1u : 0u, key.color_mask, key.alpha_test ? 1u : 0u, key.raw ? 1u : 0u};
+            key.cull_clockwise ? 1u : 0u, key.color_mask, key.alpha_test ? 1u : 0u, key.raw ? 1u : 0u,
+            (key.stencil ? 1u : 0u) | key.stencil_function << 1u | key.stencil_fail << 4u |
+                key.stencil_depth_fail << 7u | key.stencil_pass << 10u,
+            key.stencil_reference | key.stencil_compare_mask << 8u | key.stencil_write_mask << 16u};
 }
 
 PipelineKey key_from(const std::array<std::uint32_t, kPipelineKeyWords> &words) {
@@ -4939,6 +5210,14 @@ PipelineKey key_from(const std::array<std::uint32_t, kPipelineKeyWords> &words) 
     key.color_mask = words[9] & 0xFu;
     key.alpha_test = words[10] != 0u;
     key.raw = words[11] != 0u;
+    key.stencil = (words[12] & 1u) != 0u;
+    key.stencil_function = (words[12] >> 1u) & 7u;
+    key.stencil_fail = (words[12] >> 4u) & 7u;
+    key.stencil_depth_fail = (words[12] >> 7u) & 7u;
+    key.stencil_pass = (words[12] >> 10u) & 7u;
+    key.stencil_reference = words[13] & 0xFFu;
+    key.stencil_compare_mask = (words[13] >> 8u) & 0xFFu;
+    key.stencil_write_mask = (words[13] >> 16u) & 0xFFu;
     return key;
 }
 
@@ -4984,7 +5263,7 @@ void VulkanRenderer::Impl::prewarm_pipelines() {
         if (!in) return;
         in.seekg(0, std::ios::end);
         const std::streamoff size = in.tellg();
-        if (size < 16 || size % 4 != 0 || size > 16 + static_cast<std::streamoff>(kMaxPipelineKeys) * 48) return;
+        if (size < 16 || size % 4 != 0 || size > 16 + static_cast<std::streamoff>(kMaxPipelineKeys) * kPipelineKeyWords * 4) return;
         in.seekg(0);
         data.resize(static_cast<std::size_t>(size / 4));
         in.read(reinterpret_cast<char *>(data.data()), size);
@@ -5137,6 +5416,17 @@ VkPipeline VulkanRenderer::Impl::create_pipeline(const PipelineKey &key) const {
     depth.depthTestEnable = key.depth_test ? VK_TRUE : VK_FALSE;
     depth.depthWriteEnable = key.depth_write ? VK_TRUE : VK_FALSE;
     depth.depthCompareOp = to_compare_op(key.depth_function);
+    if (key.stencil && has_stencil()) {
+        depth.stencilTestEnable = VK_TRUE;
+        depth.front.failOp = to_stencil_op(key.stencil_fail);
+        depth.front.passOp = to_stencil_op(key.stencil_pass);
+        depth.front.depthFailOp = to_stencil_op(key.stencil_depth_fail);
+        depth.front.compareOp = to_compare_op(key.stencil_function);
+        depth.front.compareMask = key.stencil_compare_mask;
+        depth.front.writeMask = key.stencil_write_mask;
+        depth.front.reference = key.stencil_reference;
+        depth.back = depth.front;
+    }
 
     VkPipelineColorBlendAttachmentState blend_attachment{};
     blend_attachment.blendEnable = key.blend ? VK_TRUE : VK_FALSE;
@@ -5519,6 +5809,9 @@ void VulkanRenderer::Impl::resize_targets(VkExtent2D extent) {
     }
     std::map<std::uint32_t, Target> old_targets = std::move(targets);
     targets.clear();
+    // Extracts name targets that are going; they are filled again on use.
+    for (Extract &e : extracts) e.target = nullptr;
+    target_aliases.clear();
     const VkExtent2D old_extent = target_extent;
     target_extent = extent;
     std::vector<std::pair<Target *, const Target *>> copies;
@@ -5693,6 +5986,19 @@ void VulkanRenderer::set_sharp_textures(bool sharp) {
                                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             write.dstSet = target.copy_descriptors[i];
+            write.descriptorCount = 1u;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &image_info;
+            vkUpdateDescriptorSets(impl.device, 1u, &write, 0u, nullptr);
+        }
+    }
+    for (Impl::Extract &e : impl.extracts) {
+        for (std::size_t i = 0; i < e.descriptors.size(); ++i) {
+            if (e.descriptors[i] == VK_NULL_HANDLE) continue;
+            VkDescriptorImageInfo image_info{impl.texture_sampler(), i == 0u ? e.view : e.opaque_view,
+                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = e.descriptors[i];
             write.descriptorCount = 1u;
             write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             write.pImageInfo = &image_info;
@@ -6014,6 +6320,56 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     // decoded vertices (GeState::set_raw_vertices).
     const bool raw = call.raw_vertices != nullptr;
     if (call.vertices.empty() && !raw) return;
+
+    // A framebuffer inside another's area is drawn into that target, moved
+    // by its offset (Impl::TargetAlias).
+    if (const std::optional<Impl::TargetAlias> alias = impl.alias_for(call.target)) {
+        static const bool trace_aliases = portablekit::env("TRACE_ALIASES") != nullptr;
+        if (trace_aliases && impl.frames % 600u == 0u)
+            std::printf("[alias] frame %llu 0x%08x -> 0x%08x +%u,%u %s clear %d/%u prim %d verts %zu vp %.1f,%.1f "
+                        "scale %.1f,%.1f off %.1f,%.1f scissor %u,%u-%u,%u tex %s 0x%08x %ux%u bufw %u blend %d %u/%u "
+                        "depth %d/%d color 0x%08x\n",
+                        static_cast<unsigned long long>(impl.frames), call.target.color_address, alias->base, alias->x,
+                        alias->y, call.through ? "through" : "3d", call.clear_mode ? 1 : 0, call.clear_flags,
+                        static_cast<int>(call.primitive), call.vertices.size(), call.viewport.x_offset,
+                        call.viewport.y_offset, call.viewport.x_scale, call.viewport.y_scale, call.viewport.offset_x,
+                        call.viewport.offset_y, call.viewport.scissor_x1, call.viewport.scissor_y1,
+                        call.viewport.scissor_x2, call.viewport.scissor_y2, call.texture.enabled ? "on" : "off",
+                        call.texture.address, call.texture.width, call.texture.height, call.texture.buffer_width,
+                        call.blend.enabled ? 1 : 0, call.blend.source_factor, call.blend.destination_factor,
+                        call.depth.test_enabled ? 1 : 0, call.depth.write_enabled ? 1 : 0,
+                        call.vertices.empty() ? 0u : call.vertices.front().color);
+        // The words the target's textures are checked against are read again
+        // when the game first draws at this address in a frame, as they would
+        // be for a target of its own: the game fills the memory around it
+        // with textures between its draws there (God of War: Ghost of Sparta
+        // uploads textures just below its shadow maps' blur buffer).
+        Impl::TargetAlias &known = impl.target_aliases[call.target.color_address];
+        if (known.drawn_frame != impl.frames) {
+            known.drawn_frame = impl.frames;
+            if (const auto base = impl.targets.find(alias->base); base != impl.targets.end())
+                base->second.last_drawn_frame = impl.frames - 1u;
+        }
+        DrawCall moved = call;
+        moved.target.color_address = alias->base;
+        const auto dx = static_cast<float>(alias->x);
+        const auto dy = static_cast<float>(alias->y);
+        if (moved.through) {
+            for (Vertex &vertex : moved.vertices) {
+                vertex.position[0] += dx;
+                vertex.position[1] += dy;
+            }
+        } else {
+            moved.viewport.x_offset += dx;
+            moved.viewport.y_offset += dy;
+        }
+        moved.viewport.scissor_x1 += alias->x;
+        moved.viewport.scissor_x2 += alias->x;
+        moved.viewport.scissor_y1 += alias->y;
+        moved.viewport.scissor_y2 += alias->y;
+        submit(moved, memory);
+        return;
+    }
 
     // Everything becomes a triangle list; sprites expand to two triangles.
     impl.scratch.clear();
@@ -6585,6 +6941,8 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     const auto drawn_vertices = static_cast<std::uint32_t>(direct ? vertex_total : impl.scratch.size());
 
     PipelineKey key{};
+    // <prefix>_NO_STENCIL ignores the stencil test, as before.
+    static const bool no_stencil = portablekit::env("NO_STENCIL") != nullptr;
     if (call.clear_mode) {
         // sceGuClear draws a screen-sized sprite with CLEARMODE on: blending,
         // the depth test and the texture are bypassed and bits 8..10 say which
@@ -6602,6 +6960,18 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                                                           VK_COLOR_COMPONENT_B_BIT)
                                                        : 0u) |
                          ((call.clear_flags & 2u) != 0u ? VK_COLOR_COMPONENT_A_BIT : 0u);
+        // Clearing alpha clears the stencil, which the PSP keeps there, to the
+        // clear's alpha.
+        const auto drawn = impl.targets.find(call.target.color_address);
+        if ((call.clear_flags & 2u) != 0u && !call.vertices.empty() && impl.has_stencil() && !no_stencil &&
+            drawn != impl.targets.end() && drawn->second.stencil_used) {
+            key.stencil = true;
+            key.stencil_function = 1u;  // always
+            key.stencil_fail = key.stencil_depth_fail = key.stencil_pass = 2u;  // replace
+            key.stencil_reference = call.vertices.back().color >> 24u;
+            key.stencil_compare_mask = 0xFFu;
+            key.stencil_write_mask = 0xFFu;
+        }
     } else {
         key.blend = call.blend.enabled;
         key.source_factor = resolve_fixed_factor(call.blend.source_factor, call.blend.fixed_source);
@@ -6618,6 +6988,41 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         key.depth_function = call.depth.function;
         key.cull = call.culling_enabled && !call.through && call.primitive != PrimitiveType::Sprites;
         key.cull_clockwise = call.cull_clockwise;
+        // Only an 8888 framebuffer has the eight bits of stencil the game
+        // means; the others have fewer, which no game seen uses.
+        // <prefix>_TRACE_STENCIL: the draws that test the stencil, in the
+        // frames given by its value (every 600th by default), one line each.
+        static const std::uint64_t trace_stencil_every = [] {
+            const char *text = portablekit::env("TRACE_STENCIL");
+            return text == nullptr ? 0ull : std::max<std::uint64_t>(1ull, std::strtoull(text, nullptr, 10));
+        }();
+        if (call.stencil.enabled && trace_stencil_every != 0u && impl.frames % trace_stencil_every == 0u) {
+            std::printf("[stencil] frame %llu target 0x%08x func %u ref 0x%02x mask 0x%02x ops %u/%u/%u write 0x%02x "
+                        "%s prim %d verts %zu depth %d/%d/%u blend %d %u/%u/%u tex %s 0x%08x %ux%u fmt %d color 0x%08x\n",
+                        static_cast<unsigned long long>(impl.frames), call.target.color_address, call.stencil.function,
+                        call.stencil.reference, call.stencil.mask, call.stencil.fail, call.stencil.depth_fail,
+                        call.stencil.pass, call.stencil.write_mask, call.through ? "through" : "3d",
+                        static_cast<int>(call.primitive), call.vertices.size(), call.depth.test_enabled ? 1 : 0,
+                        call.depth.write_enabled ? 1 : 0, call.depth.function, call.blend.enabled ? 1 : 0,
+                        call.blend.source_factor, call.blend.destination_factor, call.blend.equation,
+                        call.texture.enabled ? "on" : "off", call.texture.address, call.texture.width,
+                        call.texture.height, static_cast<int>(call.texture.format),
+                        call.vertices.empty() ? 0u : call.vertices.front().color);
+        }
+        if (call.stencil.enabled && impl.has_stencil() && !no_stencil) {
+            if (const auto drawn = impl.targets.find(call.target.color_address); drawn != impl.targets.end())
+                drawn->second.stencil_used = true;
+            key.stencil = true;
+            key.stencil_function = call.stencil.function;
+            key.stencil_fail = call.stencil.fail;
+            // The PSP updates the stencil on a failed depth test only when the
+            // depth test is on.
+            key.stencil_depth_fail = key.depth_test ? call.stencil.depth_fail : call.stencil.pass;
+            key.stencil_pass = call.stencil.pass;
+            key.stencil_reference = call.stencil.reference;
+            key.stencil_compare_mask = call.stencil.mask;
+            key.stencil_write_mask = call.stencil.write_mask;
+        }
     }
     // Matches texture_params.w below: without an alpha test the pipeline's
     // shader has no discard. <prefix>_NO_ALPHA_VARIANTS keeps the one shader
@@ -6665,12 +7070,37 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     VkDescriptorSet texture_descriptor = impl.white_texture.descriptor;
     if (call.texture.enabled && !call.clear_mode) {
         const Impl::FramebufferTexture &source = framebuffer_source;
+        // A texture that is part of the target, read by a draw that may sample
+        // past its edges: a 3D draw, whose coordinates are not known here, or
+        // a through draw whose coordinates leave the texture. <prefix>_NO_FB_EXTRACTS
+        // reads every such texture from the target's copy, as before.
+        static const bool no_extracts = portablekit::env("NO_FB_EXTRACTS") != nullptr;
+        bool extract = false;
+        if (source.target != nullptr && !no_extracts && source.x + call.texture.width <= kPspWidth &&
+            source.y + call.texture.height <= kPspHeight &&
+            (call.texture.width < kPspWidth || call.texture.height < kPspHeight)) {
+            extract = !call.through;
+            const auto w = static_cast<float>(call.texture.width);
+            const auto h = static_cast<float>(call.texture.height);
+            for (std::size_t i = 0; !extract && i < call.vertices.size(); ++i) {
+                const Vertex &vertex = call.vertices[i];
+                extract = vertex.texcoord[0] < 0.0f || vertex.texcoord[1] < 0.0f || vertex.texcoord[0] > w ||
+                          vertex.texcoord[1] > h;
+            }
+        }
+        const bool opaque = call.texture.format == TextureFormat::Rgba5650;
+        const VkDescriptorSet extracted =
+            extract ? impl.framebuffer_extract(source, call.texture.width, call.texture.height, opaque)
+                    : VK_NULL_HANDLE;
         const VkDescriptorSet copy =
-            source.target != nullptr
-                ? impl.framebuffer_descriptor(source, call.texture.width, call.texture.height,
-                                              call.texture.format == TextureFormat::Rgba5650)
+            source.target != nullptr && extracted == VK_NULL_HANDLE
+                ? impl.framebuffer_descriptor(source, call.texture.width, call.texture.height, opaque)
                 : VK_NULL_HANDLE;
-        if (copy != VK_NULL_HANDLE) {
+        if (extracted != VK_NULL_HANDLE) {
+            // The image is the texture: coordinates and the clamp flags apply
+            // as they are.
+            texture_descriptor = extracted;
+        } else if (copy != VK_NULL_HANDLE) {
             // Texture coordinates address the game's texture, whose first texel
             // is pixel (x, y) of a target that holds 480x272 guest pixels at
             // any internal scale.
@@ -6692,7 +7122,10 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
 
     // A draw that writes depth into a pass begun without it: the pass ends and
     // one that keeps depth begins.
-    if (key.depth_write && impl.pass_active && impl.pass_depthless) impl.end_pass();
+    // A draw that writes depth, or uses the stencil, into a pass begun without
+    // the depth and stencil attachment: the pass ends and one with it begins.
+    const bool uses_depth_attachment = key.depth_write || key.stencil;
+    if (uses_depth_attachment && impl.pass_active && impl.pass_depthless) impl.end_pass();
     if (!impl.pass_active || impl.current_target != call.target.color_address) {
         impl.end_pass();
         // A clear that covers the whole screen, first in its pass, writes
@@ -6714,7 +7147,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                 if ((call.clear_flags & 4u) != 0u) overwritten |= 2u;
             }
         }
-        impl.begin_pass(call.target.color_address, overwritten, key.depth_write);
+        impl.begin_pass(call.target.color_address, overwritten, uses_depth_attachment);
         if (!impl.pass_active) return;
     }
     {
@@ -6846,7 +7279,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         if (!Impl::area_holds(impl.pass_area, reach)) {
             const std::uint32_t overwritten = impl.pass_drawn ? 0u : impl.pass_overwritten;
             impl.end_pass();
-            impl.begin_pass(call.target.color_address, overwritten, key.depth_write);
+            impl.begin_pass(call.target.color_address, overwritten, uses_depth_attachment);
             if (!impl.pass_active) return;
         }
     }
@@ -7986,7 +8419,13 @@ bool VulkanRenderer::present(std::uint32_t display_address,
         std::cout << "[direct-check] " << impl.direct_checked << " draws compared, " << impl.direct_mismatched
                   << " differed" << std::endl;
 
-    static const bool no_writeback = portablekit::env("NO_FB_TEXTURES") != nullptr;
+    // The shown frame is copied back into guest VRAM for a game that reads it
+    // with the CPU. A game that never does says so in its profile, and saves
+    // the copy and its conversion every frame. <prefix>_NO_FRAME_WRITEBACK
+    // turns it off for any game, to find out.
+    static const bool no_writeback = portablekit::env("NO_FB_TEXTURES") != nullptr ||
+                                     portablekit::env("NO_FRAME_WRITEBACK") != nullptr ||
+                                     !portablekit::game().frame_writeback;
     if (!no_writeback) impl.record_writeback(display_address);
 
     // Show the target the guest flipped to; fall back to whatever was drawn last.
@@ -8157,6 +8596,9 @@ bool VulkanRenderer::redrawn_every_frame(std::uint32_t address) const {
     // that double-buffers draws each one every other frame. So is anything
     // drawn in either of the last two frames.
     if (impl_->shows(address)) return true;
+    // An address drawn as part of another target is redrawn as that one is.
+    if (const auto alias = impl_->target_aliases.find(address); alias != impl_->target_aliases.end())
+        address = alias->second.base;
     const auto found = impl_->targets.find(address);
     return found != impl_->targets.end() && found->second.initialized &&
            found->second.last_drawn_frame + 2u >= impl_->frames;
@@ -8353,6 +8795,7 @@ void VulkanRenderer::shutdown() {
     vkDestroyShaderModule(impl.device, impl.fragment_shader, nullptr);
     for (auto &[address, target] : impl.targets) impl.destroy_target(target);
     impl.targets.clear();
+    impl.destroy_extracts();
     impl.destroy_target(impl.held);
     impl.held = {};
     impl.holding = false;
