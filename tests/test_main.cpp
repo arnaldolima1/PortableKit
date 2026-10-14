@@ -1241,11 +1241,12 @@ static void test_automatic_cross_unit_tail_chaining() {
         std::ifstream generated(generated_dir / "generated_unit_0000.cpp");
         text.assign((std::istreambuf_iterator<char>(generated)), std::istreambuf_iterator<char>());
     }
-    require(text.find("(void)rt.invoke_chained_direct<&recomp_unit_0001_entry, 1u, 1u, 0x08804040u>(ctx, &aot_mem); return;") != std::string::npos,
+    require(text.find("(void)rt.invoke_chained_direct<&recomp_unit_0001_entry, 1u, 1u, 0x08804040u>(ctx, &aot_shared); return;") != std::string::npos,
             "Automatic codegen did not emit a direct-entry native chain across AOT units");
     require(text.find("ctx.pc = 0x08804040u; (void)rt.invoke_chained_direct") == std::string::npos,
             "Direct-entry chain still dirties ctx.pc on its successful hot path");
-    require(text.find("AotFastView &aot_mem)") != std::string::npos &&
+    require(text.find("AotFastView &aot_shared)") != std::string::npos &&
+            text.find("const AotFastView aot_mem = aot_shared;") != std::string::npos &&
             text.find("_entry(rt, ctx, 0u, aot_mem)") != std::string::npos,
             "Shared AOT memory was not threaded across generated-unit direct chains");
     // The register-cache lowering passes were removed: generated units must
@@ -1306,9 +1307,30 @@ static void test_automatic_sparse_entries() {
     // A fixed branch into another unit still chains straight to its entry.
     const auto cross_dir = generate("cross", make_cross_unit_branch_test_elf());
     require(read_unit(cross_dir / "generated_unit_0000.cpp")
-                    .find("(void)rt.invoke_chained_direct<&recomp_unit_0001_entry, 1u, 1u, 0x08804040u>(ctx, &aot_mem); return;") !=
+                    .find("(void)rt.invoke_chained_direct<&recomp_unit_0001_entry, 1u, 1u, 0x08804040u>(ctx, &aot_shared); return;") !=
                 std::string::npos,
             "Sparse entries did not make a cross-unit branch target an entry");
+
+    // A return tests the continuation of a same-unit call before dispatching.
+    auto call_bytes = make_branch_delay_test_elf();
+    const std::uint32_t call_code[] = {
+        0x0E201004u, // jal  0x08804010
+        0x00000000u, // nop
+        0x03E00008u, // jr   ra (the continuation)
+        0x00000000u, // nop
+        0x03E00008u, // 0x08804010: jr ra
+        0x00000000u, // nop
+        0x00000000u,
+    };
+    for (std::size_t i = 0; i < std::size(call_code); ++i) put32(call_bytes, 0x80u + i * 4u, call_code[i]);
+    const auto call_elf = root / "call.elf";
+    { std::ofstream out(call_elf, std::ios::binary); out.write(reinterpret_cast<const char *>(call_bytes.data()), static_cast<std::streamsize>(call_bytes.size())); }
+    const std::string hints_command = shell_quote(codegen_tool_path()) + " " + shell_quote(call_elf) +
+        " --auto " + shell_quote(root / "call") + " 0x08804000 64 --sparse-entries --return-hints";
+    require(std::system(shell_command(hints_command).c_str()) == 0, "psp_recomp --return-hints failed");
+    require(read_unit(root / "call" / "generated_unit_0000.cpp").find("if (jump_target == 0x08804008u) goto L_08804008;") !=
+                std::string::npos,
+            "--return-hints did not test the caller's continuation");
     std::filesystem::remove_all(root);
 #endif
 }

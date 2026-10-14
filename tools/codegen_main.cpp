@@ -964,11 +964,11 @@ std::string direct_unit_chain_expression(
         if (found != direct_entry_ids->end() && found->second != 0u) {
             return "rt.invoke_chained_direct<&" + generated_unit_cpp_entry_name(unit) + ", " +
                 std::to_string(unit) + "u, " + std::to_string(found->second) + "u, " +
-                psprecomp::hex32(target) + "u>(ctx, &aot_mem)";
+                psprecomp::hex32(target) + "u>(ctx, &aot_shared)";
         }
     }
     return "rt.invoke_chained_direct<&" + generated_unit_cpp_name(unit) + ", " +
-        std::to_string(unit) + "u>(ctx, &aot_mem)";
+        std::to_string(unit) + "u>(ctx, &aot_shared)";
 }
 
 void emit_target(std::ostringstream &body, std::uint32_t target,
@@ -1013,7 +1013,7 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
              << "; return;\n";
     } else {
         body << indent << "ctx.pc = " << psprecomp::hex32(target)
-             << "u; (void)rt.invoke_chained_call(ctx, &aot_mem); return;\n";
+             << "u; (void)rt.invoke_chained_call(ctx, &aot_shared); return;\n";
     }
 }
 
@@ -1034,6 +1034,9 @@ struct GeneratedFunctionInput {
     // entry_labels. Entered anywhere else, the unit interprets the guest code
     // up to the next registered address instead of stopping.
     const std::set<std::uint32_t> *dispatch_entries{};
+    // Return hints: for a `jr $ra`, the addresses it most likely returns to
+    // in this unit, tested before the dispatcher (see generate_auto).
+    const std::map<std::uint32_t, std::vector<std::uint32_t>> *return_hints{};
 };
 
 std::string emit_function_source(const GeneratedFunctionInput &function,
@@ -1073,7 +1076,12 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
         }
         body << "\n};\n";
 
-        body << "void " << cpp_name << "_entry(CorpusRuntime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, AotFastView &aot_mem) {\n"
+        body << "void " << cpp_name << "_entry(CorpusRuntime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, AotFastView &aot_shared) {\n"
+             // A copy whose address never escapes: guest stores go through a
+             // byte pointer that may alias anything, so read through the
+             // shared reference the RAM pointer and limits would be reloaded
+             // after every store. The view never changes while code runs.
+             << "    const AotFastView aot_mem = aot_shared;\n"
              << "    std::uint32_t jump_target = 0u;\n"
              << "    std::uint32_t local_transfers = 0u;\n"
              << "    std::uint32_t local_pc = ctx.pc;\n"
@@ -1113,7 +1121,12 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
              << "    }\n"
              << "    }\n";
     } else {
-        body << "void " << cpp_name << "_entry(CorpusRuntime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, AotFastView &aot_mem) {\n"
+        body << "void " << cpp_name << "_entry(CorpusRuntime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, AotFastView &aot_shared) {\n"
+             // A copy whose address never escapes: guest stores go through a
+             // byte pointer that may alias anything, so read through the
+             // shared reference the RAM pointer and limits would be reloaded
+             // after every store. The view never changes while code runs.
+             << "    const AotFastView aot_mem = aot_shared;\n"
              << "    (void)direct_entry_id;\n"
              << "    std::uint32_t jump_target = 0u;\n"
              << "    std::uint32_t local_transfers = 0u;\n"
@@ -1232,14 +1245,14 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                             if (direct_unit)
                                 body << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids);
                             else
-                                body << "rt.invoke_chained_call(ctx, &aot_mem)";
+                                body << "rt.invoke_chained_call(ctx, &aot_shared)";
                             body << " && ctx.pc == " << psprecomp::hex32(return_pc)
                                  << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
                         } else {
                             if (direct_unit)
                                 body << "    (void)" << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids) << ";\n";
                             else
-                                body << "    (void)rt.invoke_chained_call(ctx, &aot_mem);\n";
+                                body << "    (void)rt.invoke_chained_call(ctx, &aot_shared);\n";
                         }
                         body << "    return;\n";
                     }
@@ -1257,11 +1270,11 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         const std::uint32_t return_pc = pc + 8u;
                         body << "    ctx.pc = jump_target;\n";
                         if (function.entry_labels.contains(return_pc)) {
-                            body << "    if (rt.invoke_chained_call(ctx, &aot_mem) && ctx.pc == "
+                            body << "    if (rt.invoke_chained_call(ctx, &aot_shared) && ctx.pc == "
                                  << psprecomp::hex32(return_pc) << "u) goto L_"
                                  << psprecomp::hex32(return_pc).substr(2) << ";\n";
                         } else {
-                            body << "    (void)rt.invoke_chained_call(ctx, &aot_mem);\n";
+                            body << "    (void)rt.invoke_chained_call(ctx, &aot_shared);\n";
                         }
                         body << "    return;\n";
                     } else {
@@ -1269,7 +1282,17 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         // this unit continues locally; otherwise the chained
                         // caller one frame up recognizes its return address.
                         body << "    local_pc = jump_target;\n"
-                             << "    if (++local_transfers < 2048u) { entry_id = 0u; goto LOCAL_DISPATCH; }\n"
+                             << "    if (++local_transfers < 2048u) {\n";
+                        if (function.return_hints != nullptr) {
+                            if (const auto hints = function.return_hints->find(pc); hints != function.return_hints->end()) {
+                                for (const auto target : hints->second) {
+                                    body << "        if (jump_target == " << psprecomp::hex32(target) << "u) goto L_"
+                                         << psprecomp::hex32(target).substr(2) << ";\n";
+                                }
+                            }
+                        }
+                        body << "        entry_id = 0u; goto LOCAL_DISPATCH;\n"
+                             << "    }\n"
                              << "    ctx.pc = jump_target;\n"
                              << "    return;\n";
                     }
@@ -1627,7 +1650,8 @@ int generate_auto(const std::filesystem::path &elf_path,
                   std::uint32_t unit_span_bytes,
                   bool chain_units = true,
                   const std::vector<psprecomp::ExecutableRange> &extra_code_ranges = {},
-                  bool sparse_entries = false) {
+                  bool sparse_entries = false,
+                  bool return_hints = false) {
     const auto started = std::chrono::steady_clock::now();
     // Progress goes to stderr and is flushed per line so `tail -f` on a log
     // shows how far a long generation has advanced.
@@ -1753,6 +1777,56 @@ int generate_auto(const std::filesystem::path &elf_path,
     std::set<std::uint32_t> unit_indices;
     for (const auto &unit : units) unit_indices.insert(unit.bucket);
 
+    // Return hints (--return-hints). Every `jr $ra` reaches its destination
+    // through the unit's dispatcher: the PC -> entry table and one indirect
+    // branch shared by every return in the unit, which predicts badly. A
+    // function called by a `jal` (or a linking branch) in the same unit was
+    // entered by a goto, so its caller's continuation is a label here: test
+    // those first, each return with branches of its own. A return elsewhere
+    // (a tail call's caller, a caller in another unit) still dispatches.
+    constexpr std::size_t kMaximumReturnHints = 16u;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> return_hint_map;
+    if (return_hints) {
+        const auto unit_of = [&](std::uint32_t pc) { return (pc - executable_base) / unit_span_bytes; };
+        std::map<std::uint32_t, std::set<std::uint32_t>> continuations_by_callee;
+        for (const auto pc : program.covered_labels) {
+            const auto decoded = psprecomp::decode_allegrex(memory.load32(pc));
+            std::uint32_t callee = 0u;
+            if (decoded.kind == psprecomp::OpcodeKind::Jal)
+                callee = ((pc + 4u) & 0xF0000000u) | (decoded.target << 2u);
+            else if (is_branch(decoded.kind) && is_link_branch(decoded.kind))
+                callee = pc + 4u + static_cast<std::uint32_t>(static_cast<std::int32_t>(decoded.immediate) * 4);
+            else
+                continue;
+            if (unit_of(callee) == unit_of(pc) && unit_of(pc + 8u) == unit_of(pc))
+                continuations_by_callee[callee].insert(pc + 8u);
+        }
+        std::map<std::uint32_t, std::set<std::uint32_t>> hints_by_return;
+        for (const auto &function : program.functions) {
+            const auto callers = continuations_by_callee.find(function.entry);
+            if (callers == continuations_by_callee.end()) continue;
+            for (const auto pc : function.labels) {
+                const auto decoded = psprecomp::decode_allegrex(memory.load32(pc));
+                if (decoded.kind != psprecomp::OpcodeKind::Jr || decoded.rs != 31u) continue;
+                for (const auto continuation : callers->second)
+                    if (unit_of(continuation) == unit_of(pc)) hints_by_return[pc].insert(continuation);
+            }
+        }
+        std::size_t hinted = 0u;
+        for (const auto &[pc, targets] : hints_by_return) {
+            if (targets.size() > kMaximumReturnHints) continue;
+            std::vector<std::uint32_t> labels;
+            for (const auto target : targets)
+                if (global_labels.contains(target)) labels.push_back(target);
+            if (!labels.empty()) {
+                return_hint_map.emplace(pc, std::move(labels));
+                ++hinted;
+            }
+        }
+        progress("return hints at " + std::to_string(hinted) + " of " + std::to_string(hints_by_return.size()) +
+                 " returns with same-unit callers");
+    }
+
     // assign the same compact entry ids used by each unit's dense
     // dispatcher globally before emission. Fixed cross-unit edges can pass the
     // destination id directly and skip the target unit's PC->entry table lookup.
@@ -1801,6 +1875,7 @@ int generate_auto(const std::filesystem::path &elf_path,
             &import_stubs,
             chain_units ? &unit_indices : nullptr,
             sparse_entries ? &unit.entries : nullptr,
+            return_hints ? &return_hint_map : nullptr,
         };
 
         progress("unit " + std::to_string(unit_number) + "/" + std::to_string(units.size()) + " " +
@@ -1891,6 +1966,7 @@ int generate_auto(const std::filesystem::path &elf_path,
            << "  \"unique_emitted_instructions\": " << program.covered_labels.size() << ",\n"
            << "  \"unique_registered_block_entries\": " << registered_entries << ",\n"
            << "  \"sparse_entries\": " << (sparse_entries ? "true" : "false") << ",\n"
+           << "  \"return_hints\": " << return_hint_map.size() << ",\n"
            << "  \"translation_units\": " << units.size() << ",\n"
            << "  \"rewritten_translation_units\": " << rewritten_units << ",\n"
            << "  \"registry_rewritten\": " << (registry_rewritten ? "true" : "false") << ",\n"
@@ -1918,12 +1994,18 @@ int main(int argc, char **argv) {
             std::vector<std::string> positional;
             std::vector<psprecomp::ExecutableRange> extra_code;
             bool sparse_entries = false;
+            bool return_hints = false;
             for (int i = 4; i < argc; ++i) {
                 const std::string_view option(argv[i]);
                 // Dispatcher entries only where control can arrive from
                 // outside a block (see generate_auto), not at every word.
                 if (option == "--sparse-entries") {
                     sparse_entries = true;
+                    continue;
+                }
+                // Returns test their same-unit callers before dispatching.
+                if (option == "--return-hints") {
+                    return_hints = true;
                     continue;
                 }
                 // A prefixed corpus (an overlay) gets its own symbol names and
@@ -1952,18 +2034,18 @@ int main(int argc, char **argv) {
                 : 0x4000u;
             if (positional.size() > 2u) {
                 std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
-                          << " [--prefix <symbol_prefix>] [--code START-END ...] [--sparse-entries]\n";
+                          << " [--prefix <symbol_prefix>] [--code START-END ...] [--sparse-entries] [--return-hints]\n";
                 return 2;
             }
             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
             return generate_auto(argv[1], argv[3], load_base, unit_span, g_symbol_prefix == "recomp", extra_code,
-                                 sparse_entries);
+                                 sparse_entries, return_hints);
         }
         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
         std::cerr << "Usage:\n"
                   << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
                   << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
-                  << " [--prefix <symbol_prefix>] [--code START-END ...] [--sparse-entries]\n";
+                  << " [--prefix <symbol_prefix>] [--code START-END ...] [--sparse-entries] [--return-hints]\n";
         return 2;
     } catch (const std::exception &e) {
         std::cerr << "psp_recomp error: " << e.what() << "\n";
