@@ -146,6 +146,21 @@ struct GpuVertex {
 
 constexpr float kNoClamp = 1e30f;
 
+// The largest window scale up to `scale` whose window fits the usable area
+// of `display` (the screen less the taskbar or dock), with room for the title
+// bar and borders the window manager adds. Without it a window too large for
+// the screen covers all of it and looks full screen: x4 is 1920x1088, more
+// than a 1080p screen holds.
+std::uint32_t fitting_window_scale(SDL_DisplayID display, std::uint32_t scale) {
+    SDL_Rect usable{};
+    if (display == 0 || !SDL_GetDisplayUsableBounds(display, &usable)) return scale;
+    constexpr int kDecoration = 48;
+    while (scale > 1u && (static_cast<int>(kPspWidth * scale) > usable.w ||
+                          static_cast<int>(kPspHeight * scale) + kDecoration > usable.h))
+        --scale;
+    return scale;
+}
+
 void set_uv_rect(GpuVertex &vertex, float u_min, float v_min, float u_max, float v_max) {
     vertex.nx = u_min;
     vertex.ny = v_min;
@@ -2299,8 +2314,9 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
     // under them). The safe area keeps the picture clear of a camera cutout.
     window_flags |= SDL_WINDOW_FULLSCREEN;
 #endif
-    impl.window = SDL_CreateWindow(config.title.c_str(), static_cast<int>(kPspWidth * window_scale),
-                                   static_cast<int>(kPspHeight * window_scale), window_flags);
+    const std::uint32_t fitted_scale = fitting_window_scale(SDL_GetPrimaryDisplay(), window_scale);
+    impl.window = SDL_CreateWindow(config.title.c_str(), static_cast<int>(kPspWidth * fitted_scale),
+                                   static_cast<int>(kPspHeight * fitted_scale), window_flags);
     if (impl.window == nullptr) {
         error = std::string("SDL_CreateWindow failed: ") + SDL_GetError();
         return false;
@@ -5870,7 +5886,9 @@ void VulkanRenderer::set_window_scale(std::uint32_t scale) {
     if (!impl_ || impl_->window == nullptr) return;
     scale = std::clamp<std::uint32_t>(scale, 1u, settings::kMaxWindowScale);
     if ((SDL_GetWindowFlags(impl_->window) & SDL_WINDOW_FULLSCREEN) != 0u) return;
+    scale = fitting_window_scale(SDL_GetDisplayForWindow(impl_->window), scale);
     SDL_SetWindowSize(impl_->window, static_cast<int>(kPspWidth * scale), static_cast<int>(kPspHeight * scale));
+    SDL_SetWindowPosition(impl_->window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     impl_->swapchain_dirty = true;
 }
 

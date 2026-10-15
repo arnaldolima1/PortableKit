@@ -36,6 +36,9 @@
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#define DR_MP3_IMPLEMENTATION
+#define DR_MP3_NO_STDIO
+#include "dr_mp3/dr_mp3.h"
 
 #include <SDL3/SDL.h>
 
@@ -183,6 +186,88 @@ Image upload(const Pixels &p) {
     image.height = static_cast<float>(p.height);
     return image;
 }
+
+// ---------------------------------------------------------------------------
+// Music.
+
+// launcher/music.mp3 in the launcher's folders (launcher_folders()), looped
+// quietly while the launcher shows. It is the player's own file: nothing in
+// this repository or its releases ships one. Silent when the audio is muted
+// or off (<prefix>_NO_AUDIO), and when there is no such file.
+class LauncherMusic {
+public:
+    LauncherMusic() {
+        const settings::Settings &s = settings::current();
+        if (s.mute || s.volume == 0u || portablekit::env("NO_AUDIO") != nullptr) return;
+        fs::path file;
+        std::error_code ec;
+        for (const fs::path &folder : launcher_folders())
+            if (fs::is_regular_file(folder / "music.mp3", ec)) {
+                file = folder / "music.mp3";
+                break;
+            }
+        if (file.empty()) return;
+        std::optional<std::vector<std::uint8_t>> bytes = read_file(file);
+        if (!bytes) return;
+        bytes_ = std::move(*bytes);
+        if (!drmp3_init_memory(&mp3_, bytes_.data(), bytes_.size(), nullptr)) {
+            std::cout << "[launcher] cannot play " << install::path_to_utf8(file) << ": not an MP3 file\n";
+            return;
+        }
+        decoder_ = true;
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) return;
+        audio_ = true;
+        SDL_AudioSpec spec{};
+        spec.format = SDL_AUDIO_S16;
+        spec.channels = static_cast<int>(mp3_.channels);
+        spec.freq = static_cast<int>(mp3_.sampleRate);
+        stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, &feed, this);
+        if (stream_ == nullptr) return;
+        SDL_SetAudioStreamGain(stream_, kGain * static_cast<float>(std::min(s.volume, 100u)) / 100.0f);
+        SDL_ResumeAudioStreamDevice(stream_);
+        std::cout << "[launcher] playing " << install::path_to_utf8(file) << "\n";
+    }
+    ~LauncherMusic() {
+        if (stream_ != nullptr) SDL_DestroyAudioStream(stream_);
+        if (audio_) SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        if (decoder_) drmp3_uninit(&mp3_);
+    }
+    LauncherMusic(const LauncherMusic &) = delete;
+    LauncherMusic &operator=(const LauncherMusic &) = delete;
+
+private:
+    // Quiet under the menu: a share of the game's own volume setting.
+    static constexpr float kGain = 0.35f;
+
+    // On SDL's audio thread: decodes what the device asks for, starting over
+    // at the end.
+    static void SDLCALL feed(void *self, SDL_AudioStream *stream, int additional, int) {
+        LauncherMusic &m = *static_cast<LauncherMusic *>(self);
+        const drmp3_uint32 channels = m.mp3_.channels;
+        std::int16_t buffer[4096];
+        auto wanted = static_cast<drmp3_uint64>(additional) / (channels * sizeof(std::int16_t));
+        bool restarted = false;
+        while (wanted > 0u) {
+            const drmp3_uint64 chunk = std::min<drmp3_uint64>(wanted, std::size(buffer) / channels);
+            const drmp3_uint64 got = drmp3_read_pcm_frames_s16(&m.mp3_, chunk, buffer);
+            if (got == 0u) {
+                // The end: from the start again, once per call, so a file that
+                // decodes to nothing cannot spin here.
+                if (restarted || !drmp3_seek_to_pcm_frame(&m.mp3_, 0u)) return;
+                restarted = true;
+                continue;
+            }
+            SDL_PutAudioStreamData(stream, buffer, static_cast<int>(got * channels * sizeof(std::int16_t)));
+            wanted -= got;
+        }
+    }
+
+    std::vector<std::uint8_t> bytes_;
+    drmp3 mp3_{};
+    bool decoder_{};
+    bool audio_{};
+    SDL_AudioStream *stream_{};
+};
 
 // ---------------------------------------------------------------------------
 // The look.
@@ -620,6 +705,7 @@ LauncherChoice run_launcher(const fs::path &disc_image, bool always) {
     if (settings::current().launcher_skip && !always) return LauncherChoice::Play;
 
     Launcher launcher(*theme, disc_image);
+    const LauncherMusic music;
     layer.renderer().set_game_input(false);
     layer.set_interactive(true);
     const bool window_open = layer.run([&] { return launcher.frame(); }, false);
