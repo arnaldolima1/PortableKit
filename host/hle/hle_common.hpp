@@ -89,6 +89,11 @@ void log_once(const std::string &key, const std::string &message);
 void register_threadman(HleRegistrar &hle);
 void register_sysmem(HleRegistrar &hle);
 void register_io(HleRegistrar &hle, const std::filesystem::path &disc_image, const std::filesystem::path &memory_stick);
+// Copies the files of one directory of the disc ("PSP_GAME/INSDIR") into a
+// host folder, skipping those already there at the disc's size: what the
+// shell's game-data install does. Returns the bytes copied this time.
+std::uint64_t copy_disc_directory(const std::string &disc_directory, const std::filesystem::path &destination,
+                                  const std::function<void(std::uint64_t, std::uint64_t)> &progress = {});
 void register_system(HleRegistrar &hle);
 void register_media(HleRegistrar &hle);
 void register_atrac(HleRegistrar &hle);

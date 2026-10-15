@@ -811,6 +811,54 @@ void register_async_io(HleRegistrar &hle) {
 
 } // namespace
 
+std::uint64_t copy_disc_directory(const std::string &disc_directory, const std::filesystem::path &destination,
+                                  const std::function<void(std::uint64_t, std::uint64_t)> &progress) {
+    if (!io().disc) return 0u;
+    IsoImage &disc = *io().disc;
+    std::vector<std::pair<std::string, IsoImage::Entry>> files;
+    std::uint64_t total = 0u;
+    for (const std::string &name : disc.list(disc_directory)) {
+        const auto entry = disc.find(disc_directory + "/" + name);
+        if (!entry || entry->directory) continue;
+        files.emplace_back(name, *entry);
+        total += entry->size;
+    }
+    std::error_code error;
+    std::filesystem::create_directories(destination, error);
+    std::uint64_t done = 0u, copied = 0u;
+    std::vector<std::uint8_t> buffer(1u << 20u);
+    for (const auto &[name, entry] : files) {
+        const std::filesystem::path target = destination / name;
+        // A file already there at the disc's size was installed before.
+        if (std::filesystem::file_size(target, error) == entry.size && !error) {
+            done += entry.size;
+            continue;
+        }
+        const std::filesystem::path partial = target.string() + ".part";
+        std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+        std::uint64_t offset = 0u;
+        while (out && offset < entry.size) {
+            const std::size_t chunk = static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), entry.size - offset));
+            const std::size_t got =
+                disc.read(static_cast<std::uint64_t>(entry.lba) * IsoImage::kSectorSize + offset, {buffer.data(), chunk});
+            if (got != chunk) break;
+            out.write(reinterpret_cast<const char *>(buffer.data()), static_cast<std::streamsize>(chunk));
+            offset += chunk;
+            done += chunk;
+            if (progress) progress(done, total);
+        }
+        out.close();
+        if (offset != entry.size || !out) {
+            std::filesystem::remove(partial, error);
+            std::cerr << "[io] could not copy " << disc_directory << "/" << name << " to the memory stick\n";
+            continue;
+        }
+        std::filesystem::rename(partial, target, error);
+        copied += entry.size;
+    }
+    return copied;
+}
+
 void register_io(HleRegistrar &hle, const std::filesystem::path &disc_image, const std::filesystem::path &memory_stick) {
     if (!disc_image.empty()) io().disc = std::make_unique<IsoImage>(disc_image);
     io().memory_stick = memory_stick;

@@ -6,6 +6,8 @@
 #include "hle_common.hpp"
 #include "utility_dialog.hpp"
 
+#include "save_data/save_transfer.hpp"
+#include "save_data/savedata_store.hpp"
 #include "settings/settings.hpp"
 
 #if defined(PORTABLEKIT_HAS_RENDERER)
@@ -337,15 +339,13 @@ DialogLifecycle &msg_dialog() {
 // The shell's game-data install dialog.
 //
 // On a PSP this copies data from the disc to the memory stick while showing a
-// progress bar. Nothing is copied here yet: the dialog runs its life cycle and
-// reports success, so a game that waits for it gets on with its start-up
-// instead of polling for ever.
+// progress bar. Here the disc's PSP_GAME/INSDIR is copied at InitStart, with
+// no progress shown (a file already there at its size is not copied again),
+// and the dialog then runs its life cycle and reports success.
 //
-// That is a real difference from hardware, and a game that then reads what it
-// believes it installed will not find it. It says so once, and
 // <prefix>_TRACE_SAVEDATA dumps the parameter block, which is how the
-// structure's layout should be established - by reading what the game puts
-// there, not by recalling it.
+// structure's layout was established - by reading what the game puts there,
+// not by recalling it.
 DialogLifecycle &gamedata_dialog() {
     static DialogLifecycle dialog;
     return dialog;
@@ -355,9 +355,26 @@ void register_gamedata_install(HleRegistrar &hle) {
     hle.add("sceUtility", "sceUtilityGamedataInstallInitStart", [](Runtime &rt, AllegrexContext &ctx) {
         auto &memory = rt.memory();
         const std::uint32_t params = arg(ctx, 0);
-        log_once("gamedata-install",
-                 "[gamedata] the game asked the shell to install its data; the dialog reports success but "
-                 "nothing has been copied, so anything the game expects to find installed is not there");
+        // The game and data names, read off Naruto Shippuden: Ultimate Ninja
+        // Impact's request: "ULES01537" at +0x34 and "DATA" at +0x44 (its
+        // title at +0x58, "INSTALL DATA" at +0xD8). The shell copies the
+        // disc's PSP_GAME/INSDIR into ms0:/PSP/SAVEDATA/<game><data>/, which
+        // the game then opens instead of the disc.
+        const std::filesystem::path memory_stick = savedata::memory_stick();
+        const std::string game_name = params != 0u ? read_cstring(memory, params + 0x34u, 13u) : std::string();
+        const std::string data_name = params != 0u ? read_cstring(memory, params + 0x44u, 20u) : std::string();
+        if (memory_stick.empty() || game_name.empty()) {
+            log_once("gamedata-install",
+                     "[gamedata] the game asked the shell to install its data, before any save request named the "
+                     "memory stick; the dialog reports success but nothing has been copied");
+        } else {
+            const std::filesystem::path folder = savedata::savedata_root(memory_stick) / (game_name + data_name);
+            const std::uint64_t copied = copy_disc_directory("PSP_GAME/INSDIR", folder);
+            std::cout << "[gamedata] install data " << game_name << data_name << ": "
+                      << (copied != 0u ? "copied " + std::to_string(copied >> 20u) + " MiB from the disc"
+                                       : std::string("already on the memory stick"))
+                      << "\n";
+        }
         if (portablekit::env("TRACE_SAVEDATA") != nullptr && params != 0u) {
             const std::uint32_t size = memory.load32(params + dialog_common::kSizeOffset);
             std::cout << "[gamedata] InitStart params=" << psprecomp::hex32(params) << " size=" << size << "\n";
