@@ -13,6 +13,11 @@ namespace portablekit::gpu {
 
 using psprecomp::GuestMemory;
 
+// Traces every command word of the next `runs` display-list runs, as
+// <prefix>_TRACE_GE_LIST does from a fixed run; for a key pressed while the
+// game shows the screen to read. Safe from any thread.
+void request_list_trace(std::uint32_t runs);
+
 enum class PrimitiveType : std::uint8_t {
     Points = 0,
     Lines = 1,
@@ -196,6 +201,9 @@ struct DrawCall {
     bool cull_clockwise{};
     bool clear_mode{};                   // CLEARMODE is active for this draw
     std::uint32_t clear_flags{};         // CLEARMODE bits 8..10: color, alpha/stencil, depth
+    // The GE's colour mask (0xE8): bits set are not written, 8 per channel,
+    // red lowest. A draw that writes only depth sets all 24.
+    std::uint32_t color_write_mask{};
     std::uint32_t vertex_type{};
     // Where the vertices and indices were read from and how many the prim
     // consumed: what recognises the same draw in the next frame.
@@ -321,6 +329,7 @@ private:
     DepthState depth_{};
     AlphaTestState alpha_test_{};
     StencilState stencil_{};
+    std::uint32_t color_write_mask_{};
     ViewportState viewport_{};
     bool culling_enabled_{};
     bool cull_clockwise_{};

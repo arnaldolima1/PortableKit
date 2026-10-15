@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -15,6 +16,15 @@
 #include <vector>
 
 namespace portablekit::gpu {
+namespace {
+
+// Display-list runs still to trace for request_list_trace().
+std::atomic<std::uint32_t> g_requested_trace_runs{0u};
+
+} // namespace
+
+void request_list_trace(std::uint32_t runs) { g_requested_trace_runs.store(runs); }
+
 namespace {
 
 // Display list opcodes (command = word >> 24).
@@ -141,6 +151,10 @@ enum Command : std::uint32_t {
     kBlendFixedA = 0xE0,
     kBlendFixedB = 0xE1,
     kDepthWriteDisable = 0xE7,
+    // Read off Naruto Shippuden: Ultimate Ninja Impact, whose HUD draws its
+    // masks with 0xE8 0xFFFFFF (depth only, no colour) and then tests that
+    // depth (greater) to cut its bars to length.
+    kColorMask = 0xE8,  // bits set are not written, 8 per channel, red lowest
     kAlphaMask = 0xE9,  // bits set are not written: the stencil's write mask
     // Block transfer registers, read off a trace of the quest reward screen,
     // which copies the 16-bit framebuffer at 0x04000000 (512 pixels a row) to
@@ -657,6 +671,7 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
         stencil_.pass = (data >> 16u) & 7u;
         break;
     case kAlphaMask: stencil_.write_mask = ~data & 0xFFu; break;
+    case kColorMask: color_write_mask_ = data; break;
     case kMinZ: depth_.range_near = static_cast<std::uint16_t>(data); break;
     case kMaxZ: depth_.range_far = static_cast<std::uint16_t>(data); break;
 
@@ -1023,6 +1038,7 @@ void GeState::fill_draw_state(DrawCall &call) const {
     call.depth = depth_;
     call.alpha_test = alpha_test_;
     call.stencil = stencil_;
+    call.color_write_mask = color_write_mask_;
     call.viewport = viewport_;
     call.culling_enabled = culling_enabled_;
     call.cull_clockwise = cull_clockwise_;
@@ -1489,7 +1505,10 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
     }();
     static std::uint64_t runs = 0;
     const std::uint64_t run = runs++;
-    const bool dump = run >= list_trace.first && run - list_trace.first < list_trace.second;
+    bool requested = false;
+    for (std::uint32_t left = g_requested_trace_runs.load(); left != 0u && !requested;)
+        requested = g_requested_trace_runs.compare_exchange_weak(left, left - 1u);
+    const bool dump = requested || (run >= list_trace.first && run - list_trace.first < list_trace.second);
     if (dump) std::cerr << "[ge-list] run " << run << " from " << psprecomp::hex32(pc) << "\n";
 
     // The list's words are read through a host pointer to a window of it, so

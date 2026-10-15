@@ -5789,6 +5789,19 @@ bool VulkanRenderer::pump_events() {
         if (impl_->event_hook && impl_->event_hook(event)) continue;
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F3 && !event.key.repeat && impl_->overlay_ready)
             impl_->overlay_visible = !impl_->overlay_visible;
+        // <prefix>_TRACE_GE_KEY=N: F9 traces the next N display-list runs (2
+        // when N is not a number) and saves the window beside them, so the
+        // screen in front of the player can be read command by command.
+        static const char *trace_key = portablekit::env("TRACE_GE_KEY");
+        if (trace_key != nullptr && event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
+            static unsigned presses = 0u;
+            const unsigned long runs = std::strtoul(trace_key, nullptr, 0);
+            const char *dir = portablekit::env("SCREENSHOT_DIR");
+            const std::string name = "ge_trace_" + std::to_string(++presses);
+            std::cerr << "[ge-list] F9: tracing the next display lists, window saved as " << name << ".bmp\n";
+            capture_window((dir != nullptr ? std::string(dir) : std::string(".")) + "/" + name + ".bmp");
+            request_list_trace(runs != 0ul ? static_cast<std::uint32_t>(runs) : 2u);
+        }
     }
     // Only sample while the window has focus: a key still down when focus is
     // lost stays down in SDL's snapshot, which the guest sees as a held
@@ -7322,7 +7335,24 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
             ((call.blend.fixed_source + call.blend.fixed_destination) & 0x00FFFFFFu) == 0x00FFFFFFu)
             key.destination_factor = kFactorInverseConstant;
         key.equation = call.blend.equation;
-        key.depth_test = call.depth.test_enabled && !call.through;
+        // Screen-space draws test depth too, as the GE does: their z is in
+        // the same 0..65535 range the viewport maps 3D draws into. Naruto
+        // Shippuden: Ultimate Ninja Impact cuts its HUD bars this way.
+        // <prefix>_NO_THROUGH_DEPTH turns it off for them, as before.
+        static const bool no_through_depth = portablekit::env("NO_THROUGH_DEPTH") != nullptr;
+        key.depth_test = call.depth.test_enabled && !(call.through && no_through_depth);
+        // The colour mask: a channel is written unless the GE masks all of its
+        // bits (Vulkan masks whole channels; a partial mask is written), and
+        // alpha, the stencil's home on the PSP, unless its mask is all set.
+        // <prefix>_NO_COLOR_MASK writes every channel, as before.
+        static const bool no_color_mask = portablekit::env("NO_COLOR_MASK") != nullptr;
+        if (!no_color_mask) {
+            const std::uint32_t masked = call.color_write_mask;
+            key.color_mask = ((masked & 0x0000FFu) != 0x0000FFu ? VK_COLOR_COMPONENT_R_BIT : 0u) |
+                             ((masked & 0x00FF00u) != 0x00FF00u ? VK_COLOR_COMPONENT_G_BIT : 0u) |
+                             ((masked & 0xFF0000u) != 0xFF0000u ? VK_COLOR_COMPONENT_B_BIT : 0u) |
+                             (call.stencil.write_mask != 0u ? VK_COLOR_COMPONENT_A_BIT : 0u);
+        }
         key.depth_write = call.depth.write_enabled;
         key.depth_function = call.depth.function;
         key.cull = call.culling_enabled && !call.through && call.primitive != PrimitiveType::Sprites;
