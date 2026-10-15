@@ -28,6 +28,7 @@ set(PORTABLEKIT_HOST_SOURCES
     host/corpus_library.cpp
     host/audio/atrac_decoder.cpp
     host/movie/avc_decoder.cpp
+    host/movie/replacement_movie.cpp
     host/movie/psmf_demuxer.cpp
     host/movie/psmf_header.cpp
     host/audio/audio_sink.cpp

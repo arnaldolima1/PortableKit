@@ -138,12 +138,14 @@ private:
     void network();
     void system();
     bool confirm_dialog();
+    void mods();
 
     gpu::VulkanRenderer &renderer() { return Layer::get().renderer(); }
 
     // The pages, and the ones this game shows: no Network page for a game
     // without multiplayer. tab_ indexes the shown ones.
-    enum Tab { kVideo, kAudio, kControls, kNetwork, kSystem };
+    // The numbers are the launcher's too (launcher_page): Mods came last.
+    enum Tab { kVideo, kAudio, kControls, kNetwork, kSystem, kMods };
     static const std::vector<int> &shown_tabs();
     [[nodiscard]] int tab_id() const { return shown_tabs()[static_cast<std::size_t>(tab_)]; }
 
@@ -162,8 +164,8 @@ private:
 
 const std::vector<int> &Menu::shown_tabs() {
     static const std::vector<int> tabs = portablekit::game().adhoc_play
-                                             ? std::vector<int>{kVideo, kAudio, kControls, kNetwork, kSystem}
-                                             : std::vector<int>{kVideo, kAudio, kControls, kSystem};
+                                             ? std::vector<int>{kVideo, kAudio, kControls, kNetwork, kMods, kSystem}
+                                             : std::vector<int>{kVideo, kAudio, kControls, kMods, kSystem};
     return tabs;
 }
 
@@ -190,7 +192,7 @@ bool Menu::frame() {
 
     begin_panel("##menu", portablekit::game().project_name, launcher_ ? "Settings" : paused_ ? "Paused" : "Running",
                 true);
-    static const char *const kTabs[] = {"Video", "Audio", "Controls", "Network", "System"};
+    static const char *const kTabs[] = {"Video", "Audio", "Controls", "Network", "System", "Mods"};
     std::vector<const char *> labels;
     for (const int tab : shown_tabs()) labels.push_back(kTabs[tab]);
     const bool switched = tab_bar(labels.data(), static_cast<int>(labels.size()), tab_) || first_frame_;
@@ -205,6 +207,7 @@ bool Menu::frame() {
     case kAudio: audio(); break;
     case kControls: controls(); break;
     case kNetwork: network(); break;
+    case kMods: mods(); break;
     default: system(); break;
     }
     begin_footer();
@@ -293,12 +296,51 @@ LauncherPage Menu::page(int tab, bool back) {
     case kAudio: audio(); break;
     case kControls: controls(); break;
     case kNetwork: network(); break;
+    case kMods: mods(); break;
     default: system(); break;
     }
     if (confirm_ != Confirm::None && back && confirm_opened_) confirm_ = Confirm::None;
     result.set_up = !confirm_dialog();
     was_editing_ = ImGui::IsAnyItemActive();
     return result;
+}
+
+// Mods: remastered movies a mod puts in mods/movies of the data folder.
+void Menu::mods() {
+    settings::Settings &s = settings::current();
+    std::filesystem::path folder;
+    try {
+        folder = install::user_data_directory() / "mods" / "movies";
+    } catch (const std::exception &) {
+    }
+    std::vector<std::pair<std::string, std::uintmax_t>> movies;
+    std::error_code ec;
+    if (!folder.empty())
+        for (const auto &entry : std::filesystem::directory_iterator(folder, ec))
+            if (entry.path().extension() == ".264")
+                movies.emplace_back(entry.path().stem().string(), entry.file_size(ec));
+    std::sort(movies.begin(), movies.end());
+    section("Remastered movies");
+    RowOptions o = options_for("video.movie_mods",
+                               "Plays the remastered movies a mod puts in the mods/movies folder of the game's "
+                               "data (NAME.264, NAME the game's movie) in place of the game's own, with the "
+                               "game's sound.");
+    if (movies.empty() && !o.disabled) {
+        o.disabled = true;
+        o.note = "No remastered movies found";
+    } else if (!o.disabled) {
+        o.note = trf("{} found", {std::to_string(movies.size())});
+    }
+    if (choice_row("Remastered movies", s.movie_mods ? "On" : "Off", o)) {
+        s.movie_mods = !s.movie_mods;
+        settings::save();
+    }
+    if (!folder.empty() &&
+        button_row("Open the mods folder", {false, {}, "Where remastered movies go: NAME.264, for the game's "
+                                                       "movie NAME. Kit Movie Tools puts them there."}))
+        open_folder(folder);
+    for (const auto &[name, bytes] : movies)
+        info_row(name.c_str(), std::to_string(bytes / 1048576u) + " MiB");
 }
 
 void Menu::video() {

@@ -224,6 +224,13 @@ bool trace_io() {
 
 std::int64_t open_file(const std::string &full_path, std::uint32_t flags) {
     const SplitPath split = split_path(full_path);
+    // A file opened by sector is remembered by its name, for the movie player.
+    if (split.device == Device::Disc && io().disc) {
+        if (const auto lbn = parse_lbn_path(split.path))
+            if (const auto named = io().disc->path_at(static_cast<std::uint32_t>(lbn->first)))
+                remember_movie_file(*named);
+    }
+    remember_movie_file(full_path);
     OpenFile file;
     file.path = full_path;
     if (split.device == Device::Disc) {

@@ -59,6 +59,7 @@ struct Settings {
     bool frame_rate_auto{true};        // lower the frame rate rather than slow the game
     bool frame_skip{true};             // skip drawing frames rather than slow the game
     bool half_rate{};                  // a 60 fps game drawn every other frame: 30 on screen, full speed
+    bool movie_mods{true};             // play mods/movies/NAME.264 in place of the game's movie NAME
     PerfDisplay perf{PerfDisplay::Off};
 
     // Text

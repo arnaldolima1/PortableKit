@@ -77,6 +77,7 @@ const std::vector<Page> &pages() {
     static const std::vector<Page> list = [] {
         std::vector<Page> p{{"Home", -1}, {"Video", 0}, {"Audio", 1}, {"Controls", 2}};
         if (portablekit::game().adhoc_play) p.push_back({"Network", 3});
+        p.push_back({"Mods", 5});
         p.push_back({"System & saves", 4});
         return p;
     }();

@@ -1271,6 +1271,33 @@ void show_cpu_picture_in_vram(Runtime &rt, std::uint32_t address, std::uint32_t 
 #endif
 }
 
+namespace {
+std::string &movie_file() {
+    static std::string path;
+    return path;
+}
+} // namespace
+
+void remember_movie_file(const std::string &path) {
+    if (path.size() > 4u) {
+        std::string tail = path.substr(path.size() - 4u);
+        for (char &c : tail) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (tail == ".PMF") movie_file() = path;
+    }
+}
+
+std::string last_movie_file() { return movie_file(); }
+
+void show_large_picture_in_vram(std::uint32_t address, const std::uint8_t *rgba, std::uint32_t width,
+                                std::uint32_t height) {
+#if defined(PORTABLEKIT_HAS_RENDERER)
+    if ((address & 0x1F000000u) != kEdramBase || !media().renderer || !media().renderer->available()) return;
+    media().renderer->upload_frame(address | kEdramBase, rgba, width, height, width);
+#else
+    (void)address, (void)rgba, (void)width, (void)height;
+#endif
+}
+
 std::uint32_t host_pad_buttons() {
 #if defined(PORTABLEKIT_HAS_RENDERER)
     if (!media().renderer || !media().renderer->available()) return 0u;
