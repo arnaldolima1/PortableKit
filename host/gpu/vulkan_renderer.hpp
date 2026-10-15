@@ -139,6 +139,15 @@ public:
     // writes that framebuffer back to guest memory, so the copy gets the
     // picture. Waits for the GPU. <prefix>_NO_FB_TEXTURES turns it off.
     void read_back_framebuffer(std::uint32_t source, GuestMemory &memory);
+    // A block transfer wrote `width` x `height` pixels at (x, y) of rows
+    // `stride` pixels long from `destination` in guest memory: when that is in
+    // a framebuffer the GE drew, the same pixels go into its target, so the
+    // picture shows them. Naruto Shippuden: Ultimate Ninja Impact saves a
+    // corner of its frame to memory, draws into it and copies it back.
+    // <prefix>_NO_FB_WRITES leaves them in guest memory only, as before.
+    void write_framebuffer_region(std::uint32_t destination, std::uint32_t x, std::uint32_t y, std::uint32_t width,
+                                  std::uint32_t height, std::uint32_t stride, std::uint32_t bytes_per_pixel,
+                                  const GuestMemory &memory);
     // Ends the frame and shows the target the guest just flipped to. Draws go to
     // a separate offscreen target per guest framebuffer address, so only the
     // displayed one reaches the window. `moment` is the real time the flip's

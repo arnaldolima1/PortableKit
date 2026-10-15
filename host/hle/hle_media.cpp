@@ -181,8 +181,14 @@ void block_transfer(Runtime &rt, const gpu::BlockTransfer &transfer) {
         std::memmove(destination, source, row_bytes);
     }
 #if defined(PORTABLEKIT_HAS_RENDERER)
-    // Textures already looked up in this list may have changed.
-    if (media().renderer && media().renderer->available()) media().renderer->begin_display_list();
+    if (media().renderer && media().renderer->available()) {
+        // Into a framebuffer the GE drew: its picture changes too.
+        media().renderer->write_framebuffer_region(transfer.destination, transfer.destination_x,
+                                                   transfer.destination_y, transfer.width, transfer.height,
+                                                   transfer.destination_stride, transfer.bytes_per_pixel, memory);
+        // Textures already looked up in this list may have changed.
+        media().renderer->begin_display_list();
+    }
 #endif
 }
 

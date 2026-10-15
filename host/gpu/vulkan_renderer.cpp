@@ -1144,6 +1144,17 @@ struct VulkanRenderer::Impl {
     void destroy_upload();
     bool create_upload(std::uint32_t width, std::uint32_t height, std::string &error);
 
+    // Block transfers into a framebuffer the GE drew (write_framebuffer_region):
+    // the rectangle, decoded from guest memory, goes through a staging buffer
+    // per frame slot into an image of the PSP's screen size, then is scaled
+    // into its place in the target.
+    VkImage framebuffer_write_image{};
+    VkDeviceMemory framebuffer_write_memory{};
+    VkImageView framebuffer_write_view{};
+    static constexpr VkDeviceSize kFramebufferWriteBytes = 4u * kPspWidth * kPspHeight * 4u;
+    void destroy_framebuffer_writes();
+    bool create_framebuffer_writes(std::string &error);
+
     // One offscreen target per guest framebuffer address. The game draws into
     // several (double buffering, render to texture), and only the address passed
     // to sceDisplaySetFrameBuf is shown.
@@ -1264,6 +1275,10 @@ struct VulkanRenderer::Impl {
         WritebackFrame writeback_recorded{};
         // A frame the game wrote itself (upload_frame()).
         Staging movie{};
+        // Rectangles block transfers wrote into drawn framebuffers this frame
+        // (write_framebuffer_region()), one after another.
+        Staging framebuffer_writes{};
+        VkDeviceSize framebuffer_writes_used{};
         std::uint32_t gpu_timer_pending{};  // queries the frame wrote, read after its fence
         std::uint32_t region{kNoRegion};    // of the vertex and index buffers
         // <prefix>_CHECK_GPU_DECODE: the draws the frame checks and the host's
@@ -4247,6 +4262,52 @@ bool VulkanRenderer::Impl::create_upload(std::uint32_t width, std::uint32_t heig
     return true;
 }
 
+void VulkanRenderer::Impl::destroy_framebuffer_writes() {
+    for (FrameSlot &frame : slots) {
+        Staging &staging = frame.framebuffer_writes;
+        if (staging.mapped != nullptr) vkUnmapMemory(device, staging.memory);
+        vkDestroyBuffer(device, staging.buffer, nullptr);
+        vkFreeMemory(device, staging.memory, nullptr);
+        staging = Staging{};
+        frame.framebuffer_writes_used = 0u;
+    }
+    vkDestroyImageView(device, framebuffer_write_view, nullptr);
+    vkDestroyImage(device, framebuffer_write_image, nullptr);
+    vkFreeMemory(device, framebuffer_write_memory, nullptr);
+    framebuffer_write_view = VK_NULL_HANDLE;
+    framebuffer_write_image = VK_NULL_HANDLE;
+    framebuffer_write_memory = VK_NULL_HANDLE;
+}
+
+bool VulkanRenderer::Impl::create_framebuffer_writes(std::string &error) {
+    if (!create_image(kPspWidth, kPspHeight, VK_FORMAT_R8G8B8A8_UNORM,
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, framebuffer_write_image,
+                      framebuffer_write_memory, framebuffer_write_view, VK_IMAGE_ASPECT_COLOR_BIT, error))
+        return false;
+    VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    buffer_info.size = kFramebufferWriteBytes;
+    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    for (FrameSlot &frame : slots) {
+        Staging &staging = frame.framebuffer_writes;
+        if (!check(vkCreateBuffer(device, &buffer_info, nullptr, &staging.buffer), "vkCreateBuffer", error))
+            return false;
+        VkMemoryRequirements requirements{};
+        vkGetBufferMemoryRequirements(device, staging.buffer, &requirements);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = find_memory_type(
+            requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!check(vkAllocateMemory(device, &allocate, nullptr, &staging.memory), "vkAllocateMemory", error))
+            return false;
+        vkBindBufferMemory(device, staging.buffer, staging.memory, 0u);
+        if (!check(vkMapMemory(device, staging.memory, 0u, kFramebufferWriteBytes, 0u, &staging.mapped),
+                   "vkMapMemory", error))
+            return false;
+    }
+    return true;
+}
+
 void VulkanRenderer::Impl::begin_pass(std::uint32_t address, std::uint32_t overwritten, bool writes_depth) {
     std::string error;
     Target *target = target_for(address, error);
@@ -6446,6 +6507,7 @@ void VulkanRenderer::begin_frame() {
     perf::add_wait_time(perf::Clock::now() - wait_start, perf::Stall::Fence);
     vkResetFences(impl.device, 1u, &impl.frame_fence);
     impl.release_frame_uploads(impl.slot);
+    frame.framebuffer_writes_used = 0u;
     impl.collect_gpu_time(impl.slot);
     impl.compare_gpu_decode(impl.slot);
     // With one frame in flight its write-back is taken here, as before;
@@ -7846,6 +7908,127 @@ void VulkanRenderer::read_back_framebuffer(std::uint32_t source, GuestMemory &me
                   << " back for a block transfer\n";
 }
 
+void VulkanRenderer::write_framebuffer_region(std::uint32_t destination, std::uint32_t x, std::uint32_t y,
+                                              std::uint32_t width, std::uint32_t height, std::uint32_t stride,
+                                              std::uint32_t bytes_per_pixel, const GuestMemory &memory) {
+    Impl &impl = *impl_;
+    static const bool disabled = portablekit::env("NO_FB_WRITES") != nullptr;
+    if (!impl.ready || disabled || width == 0u || height == 0u) return;
+    // The drawn framebuffer the rectangle falls in, at the same row length
+    // and pixel size; anything else is guest memory only, as before.
+    const std::uint32_t wanted = GuestMemory::canonical(destination);
+    Impl::Target *target = nullptr;
+    std::uint32_t address = 0u, base = 0u;
+    for (auto &[key, candidate] : impl.targets) {
+        if (!candidate.initialized || candidate.guest_words.empty()) continue;
+        const std::uint32_t pixel_bytes = framebuffer_bytes_per_pixel(candidate.format);
+        const std::uint32_t start = GuestMemory::canonical(key);
+        if (wanted < start || wanted - start >= candidate.stride * kPspHeight * pixel_bytes) continue;
+        if (pixel_bytes != bytes_per_pixel || candidate.stride != stride || (wanted - start) % pixel_bytes != 0u)
+            continue;
+        target = &candidate;
+        address = key;
+        base = start;
+        break;
+    }
+    if (target == nullptr) return;
+    const std::uint32_t first = (wanted - base) / bytes_per_pixel;
+    const std::uint32_t left = first % stride + x, top = first / stride + y;
+    if (left >= kPspWidth || top >= kPspHeight) return;
+    const std::uint32_t columns = std::min(width, kPspWidth - left), rows = std::min(height, kPspHeight - top);
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(columns) * rows * 4u;
+
+    std::string error;
+    if (impl.framebuffer_write_image == VK_NULL_HANDLE && !impl.create_framebuffer_writes(error)) {
+        std::cout << "[render] cannot write block transfers into framebuffers: " << error << "\n";
+        impl.destroy_framebuffer_writes();
+        return;
+    }
+    if (!impl.recording) begin_frame();
+    Impl::FrameSlot &frame = impl.slots[impl.slot];
+    if (frame.framebuffer_writes_used + bytes > Impl::kFramebufferWriteBytes) {
+        static bool said = false;
+        if (!said)
+            std::cout << "[render] too many block transfers into framebuffers in one frame; the rest reach guest "
+                         "memory only\n";
+        said = true;
+        return;
+    }
+    impl.end_pass();
+
+    // Guest pixels to RGBA, red in the low byte, as the targets hold them.
+    const VkDeviceSize offset = frame.framebuffer_writes_used;
+    auto *out = reinterpret_cast<std::uint32_t *>(static_cast<std::uint8_t *>(frame.framebuffer_writes.mapped) + offset);
+    for (std::uint32_t row = 0; row < rows; ++row) {
+        const std::uint32_t line = base + ((top + row) * stride + left) * bytes_per_pixel;
+        for (std::uint32_t column = 0; column < columns; ++column) {
+            const std::uint32_t at = line + column * bytes_per_pixel;
+            std::uint32_t rgba;
+            if (target->format == 3u) {
+                rgba = memory.load32(at);
+            } else {
+                const std::uint32_t p = memory.load16(at);
+                std::uint32_t r, g, b, a;
+                if (target->format == 0u) {
+                    r = (p & 31u) << 3u | (p & 31u) >> 2u;
+                    g = ((p >> 5u) & 63u) << 2u | ((p >> 5u) & 63u) >> 4u;
+                    b = ((p >> 11u) & 31u) << 3u | ((p >> 11u) & 31u) >> 2u;
+                    a = 255u;
+                } else if (target->format == 1u) {
+                    r = (p & 31u) << 3u | (p & 31u) >> 2u;
+                    g = ((p >> 5u) & 31u) << 3u | ((p >> 5u) & 31u) >> 2u;
+                    b = ((p >> 10u) & 31u) << 3u | ((p >> 10u) & 31u) >> 2u;
+                    a = (p >> 15u) != 0u ? 255u : 0u;
+                } else {
+                    r = (p & 15u) * 17u;
+                    g = ((p >> 4u) & 15u) * 17u;
+                    b = ((p >> 8u) & 15u) * 17u;
+                    a = ((p >> 12u) & 15u) * 17u;
+                }
+                rgba = r | g << 8u | b << 16u | a << 24u;
+            }
+            out[static_cast<std::size_t>(row) * columns + column] = rgba;
+        }
+    }
+    frame.framebuffer_writes_used += (bytes + 15u) & ~VkDeviceSize{15u};
+
+    impl.transition(impl.command_buffer, impl.framebuffer_write_image, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = offset;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    copy.imageExtent = {columns, rows, 1u};
+    vkCmdCopyBufferToImage(impl.command_buffer, frame.framebuffer_writes.buffer, impl.framebuffer_write_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &copy);
+    impl.transition(impl.command_buffer, impl.framebuffer_write_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    impl.transition(impl.command_buffer, target->color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    // PSP pixels to the target's, at the internal resolution.
+    const float scale_x = static_cast<float>(impl.target_extent.width) / kPspWidth;
+    const float scale_y = static_cast<float>(impl.target_extent.height) / kPspHeight;
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    blit.srcOffsets[1] = {static_cast<std::int32_t>(columns), static_cast<std::int32_t>(rows), 1};
+    blit.dstSubresource = blit.srcSubresource;
+    blit.dstOffsets[0] = {static_cast<std::int32_t>(std::lround(left * scale_x)),
+                          static_cast<std::int32_t>(std::lround(top * scale_y)), 0};
+    blit.dstOffsets[1] = {static_cast<std::int32_t>(std::lround((left + columns) * scale_x)),
+                          static_cast<std::int32_t>(std::lround((top + rows) * scale_y)), 1};
+    vkCmdBlitImage(impl.command_buffer, impl.framebuffer_write_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   target->color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &blit, VK_FILTER_NEAREST);
+    impl.transition(impl.command_buffer, target->color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    ++target->draw_serial;
+    // What the target now stands for in guest memory, so texturing from it
+    // still takes the target rather than decoding memory.
+    impl.snapshot_guest_words(memory, address, *target);
+    static const bool trace = portablekit::env("TRACE_FB_TEXTURES") != nullptr;
+    if (trace)
+        std::cout << "[fbtex] frame " << impl.frames << " block transfer wrote " << columns << "x" << rows << " at ("
+                  << left << "," << top << ") of framebuffer 0x" << std::hex << address << std::dec << "\n";
+}
+
 namespace {
 
 // 480x272 RGBA pixels (red in the low byte) into guest framebuffer rows of
@@ -9130,6 +9313,7 @@ void VulkanRenderer::shutdown() {
     vkDestroyImage(impl.device, impl.overlay_image, nullptr);
     vkFreeMemory(impl.device, impl.overlay_memory, nullptr);
     impl.destroy_upload();
+    impl.destroy_framebuffer_writes();
     impl.destroy_writeback();
     if (impl.breadcrumbs.mapped != nullptr) vkUnmapMemory(impl.device, impl.breadcrumbs.memory);
     vkDestroyBuffer(impl.device, impl.breadcrumbs.buffer, nullptr);
