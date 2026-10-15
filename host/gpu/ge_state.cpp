@@ -1043,6 +1043,92 @@ void GeState::fill_draw_state(DrawCall &call) const {
     call.texture_matrix = texture_matrix_;
 }
 
+std::uint32_t GeState::decode_reusing(const GuestMemory &memory, std::uint32_t address, std::uint32_t count,
+                                      std::uint32_t stride, std::vector<Vertex> &out) {
+    static const bool off = portablekit::env("NO_DECODE_CACHE") != nullptr;
+    static const bool trace = portablekit::env("TRACE_DECODE_CACHE") != nullptr;
+    // Runs shorter than this cost more to look up than to decode.
+    constexpr std::uint32_t kMinVertices = 12u;
+    // Lookups between sweeps, and the most the kept copies may take.
+    constexpr std::uint64_t kSweepEvery = 1u << 16u;
+    constexpr std::size_t kMaxBytes = 48u << 20u;
+    // An entry whose bytes changed this many lookups in a row is animated
+    // by the game: it is compared, but no longer copied.
+    constexpr std::uint32_t kVolatile = 4u;
+
+    // Skinned vertices also depend on the bone matrices; through-mode ones
+    // ignore their weights.
+    const bool skinned = ((vertex_type_ >> 9u) & 3u) != 0u && (vertex_type_ & (1u << 23u)) == 0u;
+    const std::size_t bytes = static_cast<std::size_t>(stride) * count;
+    const std::uint8_t *raw = !off && !skinned && count >= kMinVertices ? memory.raw_pointer(address, bytes) : nullptr;
+    if (raw == nullptr) return decode_vertices(memory, address, vertex_type_, count, out, bone_matrices_.data());
+
+    const std::uint64_t clock = ++decode_clock_;
+    if (clock % kSweepEvery == 0u) {
+        for (auto it = decode_cache_.begin(); it != decode_cache_.end();) {
+            if (clock - it->second.used > kSweepEvery) {
+                decode_cache_bytes_ -= it->second.raw.size() + it->second.vertices.size() * sizeof(Vertex);
+                it = decode_cache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (trace)
+            std::cout << "[decode-cache] hits " << decode_hits_ << " misses " << decode_misses_ << " entries "
+                      << decode_cache_.size() << " " << (decode_cache_bytes_ >> 10u) << " KiB" << std::endl;
+        decode_hits_ = decode_misses_ = 0u;
+    }
+
+    const std::uint64_t key = static_cast<std::uint64_t>(address) | static_cast<std::uint64_t>(vertex_type_) << 32u;
+    DecodedRun &run = decode_cache_[key];
+    run.used = clock;
+    const bool same = run.raw.size() == bytes && std::memcmp(run.raw.data(), raw, bytes) == 0;
+    if (same && run.stride != 0u) {
+        ++decode_hits_;
+        out.assign(run.vertices.begin(), run.vertices.end());
+        // <prefix>_CHECK_DECODE_CACHE: every hit decoded again and compared.
+        static const bool check = portablekit::env("CHECK_DECODE_CACHE") != nullptr;
+        if (check) {
+            static std::vector<Vertex> fresh;
+            static std::uint64_t checked = 0u, wrong = 0u;
+            const std::uint32_t fresh_stride =
+                decode_vertices(memory, address, vertex_type_, count, fresh, bone_matrices_.data());
+            ++checked;
+            if (fresh_stride != run.stride || fresh.size() != out.size() ||
+                std::memcmp(fresh.data(), out.data(), out.size() * sizeof(Vertex)) != 0) {
+                ++wrong;
+                std::cout << "[decode-cache] MISMATCH at " << psprecomp::hex32(address) << " vtype "
+                          << psprecomp::hex32(vertex_type_) << " count " << count << std::endl;
+            }
+            if (checked % 100000u == 0u)
+                std::cout << "[decode-cache] checked " << checked << " hits, " << wrong << " wrong" << std::endl;
+        }
+        return run.stride;
+    }
+    ++decode_misses_;
+    const std::uint32_t decoded = decode_vertices(memory, address, vertex_type_, count, out, bone_matrices_.data());
+    run.changes = same ? 0u : run.changes + 1u;
+    const std::size_t old_bytes = run.raw.size() + run.vertices.size() * sizeof(Vertex);
+    // Animated: only the bytes, to notice when the run settles.
+    const bool keep_vertices = decoded != 0u && run.changes < kVolatile;
+    const std::size_t new_bytes = bytes + (keep_vertices ? out.size() * sizeof(Vertex) : 0u);
+    if (decoded == 0u || decode_cache_bytes_ - old_bytes + new_bytes > kMaxBytes) {
+        decode_cache_bytes_ -= old_bytes;
+        decode_cache_.erase(key);
+        return decoded;
+    }
+    if (!same) run.raw.assign(raw, raw + bytes);
+    if (keep_vertices) {
+        run.vertices.assign(out.begin(), out.end());
+        run.stride = decoded;
+    } else {
+        std::vector<Vertex>().swap(run.vertices);
+        run.stride = 0u;
+    }
+    decode_cache_bytes_ = decode_cache_bytes_ - old_bytes + new_bytes;
+    return decoded;
+}
+
 void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
     const std::uint32_t count = data & 0xFFFFu;
     const auto primitive = static_cast<PrimitiveType>((data >> 16u) & 7u);
@@ -1144,8 +1230,7 @@ void GeState::draw_primitive(const GuestMemory &memory, std::uint32_t data) {
         }
     }
     if (call.raw_vertices == nullptr || raw_also_decoded_)
-        stride = decode_vertices(memory, first_address, vertex_type_, vertex_count, call.vertices,
-                                 bone_matrices_.data());
+        stride = decode_reusing(memory, first_address, vertex_count, probe, call.vertices);
     if (split) perf::add_split(perf::Split::Decode, perf::split_ticks() - split_start);
     if (stride == 0u || (call.vertices.empty() && call.raw_vertices == nullptr)) return;
     // A prim leaves VADDR/IADDR alone but advances the pointer it consumed, so

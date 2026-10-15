@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 #include <vector>
 
 // Graphics Engine state machine: turns a PSP display list into draw calls with
@@ -367,6 +368,25 @@ private:
     std::uint64_t batch_serial_{};
     std::uint64_t state_serial_{};  // moves with every command that changes how a prim draws
     std::vector<std::uint16_t> batch_scratch_;
+    // Decoded vertices of draws that are not skinned, kept with the guest
+    // bytes they came from: a draw whose bytes are the same as last time
+    // (level geometry, most of a frame's vertices) copies them instead of
+    // decoding again. The bytes are compared whole, so a hit is exact.
+    // <prefix>_NO_DECODE_CACHE decodes every draw.
+    struct DecodedRun {
+        std::vector<std::uint8_t> raw;
+        std::vector<Vertex> vertices;
+        std::uint32_t stride{};
+        std::uint64_t used{};     // decode_clock_ when last looked up
+        std::uint32_t changes{};  // lookups in a row that found different bytes
+    };
+    std::unordered_map<std::uint64_t, DecodedRun> decode_cache_;
+    std::uint64_t decode_clock_{};
+    std::size_t decode_cache_bytes_{};
+    std::uint64_t decode_hits_{};
+    std::uint64_t decode_misses_{};
+    std::uint32_t decode_reusing(const GuestMemory &memory, std::uint32_t address, std::uint32_t count,
+                                 std::uint32_t stride, std::vector<Vertex> &out);
     void send_draw(DrawCall &call);
     void flush_batch();
     DrawSink draw_sink_;
