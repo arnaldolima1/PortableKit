@@ -105,6 +105,7 @@ struct Names {
 const Names<PresentMode> kPresentModes{
     {{PresentMode::Fifo, "vsync"}, {PresentMode::Mailbox, "mailbox"}, {PresentMode::Immediate, "immediate"}}};
 const Names<Aspect> kAspects{{{Aspect::Original, "original"}, {Aspect::Stretch, "stretch"}, {Aspect::Fill, "fill"}}};
+const Names<Antialiasing> kAntialiasing{{{Antialiasing::Off, "off"}, {Antialiasing::Fxaa, "fxaa"}}};
 const Names<PerfDisplay> kPerfDisplays{{{PerfDisplay::Off, "off"},
                                         {PerfDisplay::Overlay, "overlay"},
                                         {PerfDisplay::OverlayAndLog, "overlay+log"},
@@ -189,6 +190,12 @@ const std::vector<Field> &fields() {
         {"video.aspect", nullptr, [](Settings &s, const std::string &t) { return kAspects.parse(t, s.aspect); },
          [](const Settings &s) { return kAspects.format(s.aspect); }, nullptr},
         BOOL_FIELD("video.sharp_screen", sharp_screen),
+        {"video.antialiasing", "ANTIALIASING",
+         [](Settings &s, const std::string &t) { return kAntialiasing.parse(t, s.antialiasing); },
+         [](const Settings &s) { return kAntialiasing.format(s.antialiasing); },
+         [](Settings &s, const char *t) {
+             if (!kAntialiasing.parse(t, s.antialiasing)) s.antialiasing = Antialiasing::Off;
+         }},
         BOOL_FIELD("video.sharp_textures", sharp_textures),
         {"video.texture_pack", "TEXTURE_PACK",
          [](Settings &s, const std::string &t) { return parse_bool(t, s.texture_pack); },

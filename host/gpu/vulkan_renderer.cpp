@@ -948,6 +948,41 @@ struct VulkanRenderer::Impl {
     void destroy_level_images();
     void destroy_level_pipeline();
     void record_level(VkCommandBuffer commands, std::uint32_t image_index, float degrees);
+    bool create_picture_pipeline(VkShaderModule vertex, VkShaderModule fragment, VkPipelineLayout layout,
+                                 VkRenderPass pass, VkPipeline &pipeline, std::string &error);
+    // Antialiasing (video.antialiasing): the game frame is copied into
+    // fxaa_input, smoothed into fxaa_output at the internal resolution, and
+    // fxaa_output is scaled to the window in its place. One pair serves every
+    // frame in flight: each use is ordered after the last by the barriers
+    // around it. Made the first time antialiasing is on, again when the
+    // internal resolution changes.
+    struct FxaaImage {
+        VkImage image{};
+        VkDeviceMemory memory{};
+        VkImageView view{};
+    };
+    settings::Antialiasing antialiasing{};
+    FxaaImage fxaa_input;
+    FxaaImage fxaa_output;
+    VkExtent2D fxaa_extent{};
+    VkFramebuffer fxaa_framebuffer{};
+    VkDescriptorSet fxaa_set{};
+    VkRenderPass fxaa_render_pass{};
+    VkDescriptorSetLayout fxaa_set_layout{};
+    VkDescriptorPool fxaa_pool{};
+    VkPipelineLayout fxaa_layout{};
+    VkPipeline fxaa_pipeline{};
+    VkSampler fxaa_sampler{};
+    VkShaderModule fxaa_vertex{};
+    VkShaderModule fxaa_fragment{};
+    bool fxaa_failed{};
+    bool create_fxaa_pipeline(std::string &error);
+    bool ensure_fxaa_images();
+    void destroy_fxaa_images();
+    void destroy_fxaa_pipeline();
+    // Records the pass over `source` (in TRANSFER_SRC); returns the smoothed
+    // picture, in TRANSFER_SRC as well.
+    VkImage record_fxaa(VkCommandBuffer commands, VkImage source);
     bool ui_ready{};
     ImDrawData *ui_draw_data{};
     std::function<bool(const SDL_Event &)> event_hook;
@@ -2277,6 +2312,7 @@ bool VulkanRenderer::initialize(const RendererConfig &config, std::string &error
     impl.requested_present = player.present_mode;
     impl.aspect = usable_aspect(player.aspect);
     impl.sharp_screen = player.sharp_screen;
+    impl.antialiasing = player.antialiasing;
     impl.sharp_textures = player.sharp_textures;
     impl.trace_interpolation = portablekit::env("TRACE_INTERPOLATION") != nullptr;
     if (const interpolation::CutThresholds *thresholds = portablekit::game().interpolation_thresholds)
@@ -3350,6 +3386,59 @@ void VulkanRenderer::Impl::record_rotation(VkCommandBuffer commands, std::uint32
 }
 #endif
 
+// One triangle over the viewport, no vertex input, no blending, no depth: the
+// passes over the finished picture (level horizon, antialiasing).
+bool VulkanRenderer::Impl::create_picture_pipeline(VkShaderModule vertex, VkShaderModule fragment,
+                                                   VkPipelineLayout layout, VkRenderPass pass, VkPipeline &pipeline,
+                                                   std::string &error) {
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertex;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragment;
+    stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport.viewportCount = 1u;
+    viewport.scissorCount = 1u;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1u;
+    blend.pAttachments = &blend_attachment;
+    const std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+    dynamic.pDynamicStates = dynamic_states.data();
+    VkGraphicsPipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipeline_info.stageCount = static_cast<std::uint32_t>(stages.size());
+    pipeline_info.pStages = stages.data();
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &assembly;
+    pipeline_info.pViewportState = &viewport;
+    pipeline_info.pRasterizationState = &raster;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pColorBlendState = &blend;
+    pipeline_info.pDynamicState = &dynamic;
+    pipeline_info.layout = layout;
+    pipeline_info.renderPass = pass;
+    return check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &pipeline_info, nullptr, &pipeline),
+                 "vkCreateGraphicsPipelines", error);
+}
+
 // The pass that draws the game's picture turned for Angle + level horizon.
 bool VulkanRenderer::Impl::create_level_pipeline(std::string &error) {
     if (level_pipeline != VK_NULL_HANDLE) return true;
@@ -3423,52 +3512,8 @@ bool VulkanRenderer::Impl::create_level_pipeline(std::string &error) {
     };
     if (!create_shader(kLevelVertexShader, sizeof(kLevelVertexShader), level_vertex)) return false;
     if (!create_shader(kLevelFragmentShader, sizeof(kLevelFragmentShader), level_fragment)) return false;
-    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = level_vertex;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = level_fragment;
-    stages[1].pName = "main";
-    VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    viewport.viewportCount = 1u;
-    viewport.scissorCount = 1u;
-    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineColorBlendAttachmentState blend_attachment{};
-    blend_attachment.colorWriteMask =
-        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend.attachmentCount = 1u;
-    blend.pAttachments = &blend_attachment;
-    const std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
-    dynamic.pDynamicStates = dynamic_states.data();
-    VkGraphicsPipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pipeline_info.stageCount = static_cast<std::uint32_t>(stages.size());
-    pipeline_info.pStages = stages.data();
-    pipeline_info.pVertexInputState = &vertex_input;
-    pipeline_info.pInputAssemblyState = &assembly;
-    pipeline_info.pViewportState = &viewport;
-    pipeline_info.pRasterizationState = &raster;
-    pipeline_info.pMultisampleState = &multisample;
-    pipeline_info.pColorBlendState = &blend;
-    pipeline_info.pDynamicState = &dynamic;
-    pipeline_info.layout = level_layout;
-    pipeline_info.renderPass = level_render_pass;
-    return check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &pipeline_info, nullptr, &level_pipeline),
-                 "vkCreateGraphicsPipelines", error);
+    return create_picture_pipeline(level_vertex, level_fragment, level_layout, level_render_pass, level_pipeline,
+                                   error);
 }
 
 // One copy of the frame per swapchain image, made for the swapchain in use.
@@ -3554,6 +3599,212 @@ void VulkanRenderer::Impl::destroy_level_pipeline() {
     level_vertex = VK_NULL_HANDLE;
     level_fragment = VK_NULL_HANDLE;
     level_render_pass = VK_NULL_HANDLE;
+}
+
+// The antialiasing pass: one sampled image in, one colour attachment out,
+// both at the internal resolution.
+bool VulkanRenderer::Impl::create_fxaa_pipeline(std::string &error) {
+    if (fxaa_pipeline != VK_NULL_HANDLE) return true;
+    VkAttachmentDescription attachment{};
+    attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    // Every pixel is written.
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference reference{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1u;
+    subpass.pColorAttachments = &reference;
+    VkRenderPassCreateInfo pass_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    pass_info.attachmentCount = 1u;
+    pass_info.pAttachments = &attachment;
+    pass_info.subpassCount = 1u;
+    pass_info.pSubpasses = &subpass;
+    if (!check(vkCreateRenderPass(device, &pass_info, nullptr, &fxaa_render_pass), "vkCreateRenderPass", error))
+        return false;
+
+    // Linear: the pass samples between texels, along and across edges.
+    VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler_info.magFilter = VK_FILTER_LINEAR;
+    sampler_info.minFilter = VK_FILTER_LINEAR;
+    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (!check(vkCreateSampler(device, &sampler_info, nullptr, &fxaa_sampler), "vkCreateSampler", error)) return false;
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0u;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1u;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    set_info.bindingCount = 1u;
+    set_info.pBindings = &binding;
+    if (!check(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &fxaa_set_layout),
+               "vkCreateDescriptorSetLayout", error))
+        return false;
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u};
+    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.maxSets = 1u;
+    pool_info.poolSizeCount = 1u;
+    pool_info.pPoolSizes = &pool_size;
+    if (!check(vkCreateDescriptorPool(device, &pool_info, nullptr, &fxaa_pool), "vkCreateDescriptorPool", error))
+        return false;
+
+    VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0u, 2u * sizeof(float)};
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.setLayoutCount = 1u;
+    layout_info.pSetLayouts = &fxaa_set_layout;
+    layout_info.pushConstantRangeCount = 1u;
+    layout_info.pPushConstantRanges = &push;
+    if (!check(vkCreatePipelineLayout(device, &layout_info, nullptr, &fxaa_layout), "vkCreatePipelineLayout", error))
+        return false;
+
+    const auto create_shader = [&](const std::uint32_t *code, std::size_t size, VkShaderModule &module) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = size;
+        info.pCode = code;
+        return check(vkCreateShaderModule(device, &info, nullptr, &module), "vkCreateShaderModule", error);
+    };
+    // The level horizon's vertex shader: one triangle over the viewport.
+    if (!create_shader(kLevelVertexShader, sizeof(kLevelVertexShader), fxaa_vertex)) return false;
+    if (!create_shader(kFxaaFragmentShader, sizeof(kFxaaFragmentShader), fxaa_fragment)) return false;
+    return create_picture_pipeline(fxaa_vertex, fxaa_fragment, fxaa_layout, fxaa_render_pass, fxaa_pipeline, error);
+}
+
+// The two images at the internal resolution. A failure is reported once, and
+// the picture is then shown without antialiasing.
+bool VulkanRenderer::Impl::ensure_fxaa_images() {
+    if (fxaa_failed) return false;
+    if (fxaa_framebuffer != VK_NULL_HANDLE && fxaa_extent.width == target_extent.width &&
+        fxaa_extent.height == target_extent.height)
+        return true;
+    std::string error;
+    const auto fail = [&] {
+        std::cout << "[render] antialiasing is off: " << error << std::endl;
+        destroy_fxaa_images();
+        fxaa_failed = true;
+        return false;
+    };
+    if (fxaa_framebuffer != VK_NULL_HANDLE) {
+        // The internal resolution changed: frames in flight may still use the
+        // old pair.
+        vkDeviceWaitIdle(device);
+        destroy_fxaa_images();
+    }
+    if (!create_fxaa_pipeline(error)) return fail();
+    if (!create_image(target_extent.width, target_extent.height, VK_FORMAT_R8G8B8A8_UNORM,
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, fxaa_input.image,
+                      fxaa_input.memory, fxaa_input.view, VK_IMAGE_ASPECT_COLOR_BIT, error))
+        return fail();
+    if (!create_image(target_extent.width, target_extent.height, VK_FORMAT_R8G8B8A8_UNORM,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, fxaa_output.image,
+                      fxaa_output.memory, fxaa_output.view, VK_IMAGE_ASPECT_COLOR_BIT, error))
+        return fail();
+    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocate.descriptorPool = fxaa_pool;
+    allocate.descriptorSetCount = 1u;
+    allocate.pSetLayouts = &fxaa_set_layout;
+    if (!check(vkAllocateDescriptorSets(device, &allocate, &fxaa_set), "vkAllocateDescriptorSets", error))
+        return fail();
+    VkDescriptorImageInfo image_info{fxaa_sampler, fxaa_input.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = fxaa_set;
+    write.dstBinding = 0u;
+    write.descriptorCount = 1u;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &image_info;
+    vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+    VkFramebufferCreateInfo framebuffer_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    framebuffer_info.renderPass = fxaa_render_pass;
+    framebuffer_info.attachmentCount = 1u;
+    framebuffer_info.pAttachments = &fxaa_output.view;
+    framebuffer_info.width = target_extent.width;
+    framebuffer_info.height = target_extent.height;
+    framebuffer_info.layers = 1u;
+    if (!check(vkCreateFramebuffer(device, &framebuffer_info, nullptr, &fxaa_framebuffer), "vkCreateFramebuffer",
+               error))
+        return fail();
+    fxaa_extent = target_extent;
+    return true;
+}
+
+void VulkanRenderer::Impl::destroy_fxaa_images() {
+    if (fxaa_framebuffer != VK_NULL_HANDLE) vkDestroyFramebuffer(device, fxaa_framebuffer, nullptr);
+    // The pool holds this one set: emptied whole rather than freed set by set.
+    if (fxaa_set != VK_NULL_HANDLE) vkResetDescriptorPool(device, fxaa_pool, 0u);
+    for (FxaaImage *image : {&fxaa_input, &fxaa_output}) {
+        if (image->view != VK_NULL_HANDLE) vkDestroyImageView(device, image->view, nullptr);
+        if (image->image != VK_NULL_HANDLE) vkDestroyImage(device, image->image, nullptr);
+        if (image->memory != VK_NULL_HANDLE) vkFreeMemory(device, image->memory, nullptr);
+        *image = {};
+    }
+    fxaa_framebuffer = VK_NULL_HANDLE;
+    fxaa_set = VK_NULL_HANDLE;
+    fxaa_extent = {};
+}
+
+void VulkanRenderer::Impl::destroy_fxaa_pipeline() {
+    destroy_fxaa_images();
+    if (fxaa_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, fxaa_pipeline, nullptr);
+    if (fxaa_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, fxaa_layout, nullptr);
+    if (fxaa_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, fxaa_pool, nullptr);
+    if (fxaa_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, fxaa_set_layout, nullptr);
+    if (fxaa_sampler != VK_NULL_HANDLE) vkDestroySampler(device, fxaa_sampler, nullptr);
+    if (fxaa_vertex != VK_NULL_HANDLE) vkDestroyShaderModule(device, fxaa_vertex, nullptr);
+    if (fxaa_fragment != VK_NULL_HANDLE) vkDestroyShaderModule(device, fxaa_fragment, nullptr);
+    if (fxaa_render_pass != VK_NULL_HANDLE) vkDestroyRenderPass(device, fxaa_render_pass, nullptr);
+    fxaa_pipeline = VK_NULL_HANDLE;
+    fxaa_layout = VK_NULL_HANDLE;
+    fxaa_pool = VK_NULL_HANDLE;
+    fxaa_set_layout = VK_NULL_HANDLE;
+    fxaa_sampler = VK_NULL_HANDLE;
+    fxaa_vertex = VK_NULL_HANDLE;
+    fxaa_fragment = VK_NULL_HANDLE;
+    fxaa_render_pass = VK_NULL_HANDLE;
+}
+
+VkImage VulkanRenderer::Impl::record_fxaa(VkCommandBuffer commands, VkImage source) {
+    // The pass cannot sample the game's targets (they are not made for it),
+    // so it reads a copy: one image-sized copy at the internal resolution.
+    transition(commands, fxaa_input.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy copy{};
+    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+    copy.dstSubresource = copy.srcSubresource;
+    copy.extent = {fxaa_extent.width, fxaa_extent.height, 1u};
+    vkCmdCopyImage(commands, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fxaa_input.image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &copy);
+    perf::count_target_copy();
+    transition(commands, fxaa_input.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Also waits for the last frame's copy out of it to the window.
+    transition(commands, fxaa_output.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    pass.renderPass = fxaa_render_pass;
+    pass.framebuffer = fxaa_framebuffer;
+    pass.renderArea = {{0, 0}, fxaa_extent};
+    vkCmdBeginRenderPass(commands, &pass, VK_SUBPASS_CONTENTS_INLINE);
+    perf::count_render_pass();
+    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(fxaa_extent.width),
+                              static_cast<float>(fxaa_extent.height), 0.0f, 1.0f};
+    const VkRect2D scissor{{0, 0}, fxaa_extent};
+    vkCmdSetViewport(commands, 0u, 1u, &viewport);
+    vkCmdSetScissor(commands, 0u, 1u, &scissor);
+    vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, fxaa_pipeline);
+    vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, fxaa_layout, 0u, 1u, &fxaa_set, 0u, nullptr);
+    const float texel[2] = {1.0f / static_cast<float>(fxaa_extent.width),
+                            1.0f / static_cast<float>(fxaa_extent.height)};
+    vkCmdPushConstants(commands, fxaa_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0u, sizeof(texel), texel);
+    vkCmdDraw(commands, 3u, 1u, 0u, 0u);
+    vkCmdEndRenderPass(commands);
+    transition(commands, fxaa_output.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    return fxaa_output.image;
 }
 
 // Draws the copied frame into the image shown, turned `degrees`
@@ -3732,16 +3983,19 @@ void VulkanRenderer::Impl::submit_and_present(VkCommandBuffer commands, VkFence 
         if (source != VK_NULL_HANDLE) {
             transition(commands, source, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkImage picture = source;
+            if (antialiasing == settings::Antialiasing::Fxaa && ensure_fxaa_images())
+                picture = record_fxaa(commands, source);
             // Angle + level horizon turns the picture; everything drawn after
             // it (the overlay, the interface) stays upright.
             const float level = input::motion::level_degrees();
             if (std::fabs(level) > 0.01f && ensure_level_images() && image_index < level_images.size()) {
                 transition(commands, level_images[image_index].image, VK_IMAGE_LAYOUT_UNDEFINED,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                record_game_blit(commands, source, level_images[image_index].image);
+                record_game_blit(commands, picture, level_images[image_index].image);
                 record_level(commands, image_index, level);
             } else {
-                record_game_blit(commands, source, target);
+                record_game_blit(commands, picture, target);
             }
             transition(commands, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -5945,6 +6199,10 @@ std::array<std::uint32_t, 2> VulkanRenderer::target_size() const noexcept {
 
 void VulkanRenderer::set_sharp_screen(bool sharp) {
     if (impl_) impl_->sharp_screen = sharp;
+}
+
+void VulkanRenderer::set_antialiasing(settings::Antialiasing antialiasing) {
+    if (impl_) impl_->antialiasing = antialiasing;
 }
 
 void VulkanRenderer::set_texture_pack(bool enabled) {
@@ -8810,6 +9068,7 @@ void VulkanRenderer::shutdown() {
     impl.ui_ready = false;
     impl.destroy_swapchain_views();
     impl.destroy_level_pipeline();
+    impl.destroy_fxaa_pipeline();
 #if defined(__ANDROID__)
     impl.destroy_rotation_pipeline();
 #endif

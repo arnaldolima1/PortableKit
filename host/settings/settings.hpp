@@ -29,6 +29,9 @@ enum class PresentMode { Fifo, Mailbox, Immediate };
 // game the window's shape: its view widens or narrows to match (the vertical
 // field of view stays), and the 2D interface keeps the PSP's proportions.
 enum class Aspect { Original, Stretch, Fill };
+// Smoothing of the edges in the finished picture. Fxaa is a pass over the
+// picture at the internal resolution, before it is scaled to the window.
+enum class Antialiasing { Off, Fxaa };
 enum class PerfDisplay { Off, Overlay, OverlayAndLog, Log };
 enum class RightStick { Camera, DPad, Off };
 // The gamepad button that presses a tilting game's both tilt buttons at once
@@ -50,6 +53,7 @@ struct Settings {
     PresentMode present_mode{PresentMode::Fifo};
     Aspect aspect{Aspect::Original};
     bool sharp_screen{};               // nearest instead of linear scaling to the window
+    Antialiasing antialiasing{Antialiasing::Off};
     bool sharp_textures{};             // nearest instead of linear texture sampling
     bool texture_pack{true};           // draw an installed HD texture pack's images instead of the game's
     std::string texture_pack_folder;   // a pack used where it is instead of textures/<disc id>; empty: none

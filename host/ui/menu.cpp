@@ -434,6 +434,20 @@ void Menu::video() {
         renderer().set_sharp_screen(s.sharp_screen);
         settings::save();
     }
+    {
+        static const char *const kAntialiasing[] = {"Off", "FXAA"};
+        const int current = static_cast<int>(s.antialiasing);
+        if (const int delta = choice_row(
+                "Antialiasing", kAntialiasing[current],
+                options_for("video.antialiasing", "Smooths the jagged edges of the picture. FXAA is a light pass "
+                                                  "over the finished picture that suits phones too; it softens "
+                                                  "text a little. Higher internal resolutions smooth edges as "
+                                                  "well, at a higher cost."))) {
+            s.antialiasing = static_cast<settings::Antialiasing>(cycle(current, delta, 2));
+            renderer().set_antialiasing(s.antialiasing);
+            settings::save();
+        }
+    }
     if (choice_row("Texture filter", s.sharp_textures ? "Sharp" : "Smooth",
                    options_for("video.sharp_textures", "How the game's textures are sampled: smooth (bilinear) or "
                                                        "sharp (nearest texel)."))) {
@@ -592,6 +606,7 @@ void Menu::video() {
         restore("video.window_scale", s.window_scale, d.window_scale);
         restore("video.aspect", s.aspect, d.aspect);
         restore("video.sharp_screen", s.sharp_screen, d.sharp_screen);
+        restore("video.antialiasing", s.antialiasing, d.antialiasing);
         restore("video.sharp_textures", s.sharp_textures, d.sharp_textures);
         restore("video.texture_pack", s.texture_pack, d.texture_pack);
         restore("video.present_mode", s.present_mode, d.present_mode);
@@ -606,6 +621,7 @@ void Menu::video() {
         renderer().set_window_scale(s.window_scale);
         renderer().set_aspect(s.aspect);
         renderer().set_sharp_screen(s.sharp_screen);
+        renderer().set_antialiasing(s.antialiasing);
         renderer().set_sharp_textures(s.sharp_textures);
         renderer().set_texture_pack(s.texture_pack);
         renderer().set_present_mode(s.present_mode);

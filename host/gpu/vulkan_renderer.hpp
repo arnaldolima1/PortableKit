@@ -207,6 +207,9 @@ public:
     [[nodiscard]] static bool supports_fill() noexcept;
     [[nodiscard]] static settings::Aspect usable_aspect(settings::Aspect aspect) noexcept;
     void set_sharp_screen(bool sharp);
+    // Smooths the edges of the finished picture (settings::Antialiasing);
+    // from the next frame shown.
+    void set_antialiasing(settings::Antialiasing antialiasing);
     void set_sharp_textures(bool sharp);
     // Draws an installed HD texture pack's images instead of the game's own
     // textures (texture_pack.hpp). Takes effect from the next frame; off

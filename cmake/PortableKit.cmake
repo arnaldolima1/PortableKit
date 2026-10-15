@@ -324,7 +324,8 @@ function(portablekit_add_game target)
                 "kGeCheckVertexShader=GE_RAW_VERTICES,GE_CHECK_DECODE@${PORTABLEKIT_ROOT}/host/gpu/shaders/ge.vert"
                 "kGeFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/ge.frag"
                 "kLevelVertexShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/level.vert"
-                "kLevelFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/level.frag")
+                "kLevelFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/level.frag"
+                "kFxaaFragmentShader=${PORTABLEKIT_ROOT}/host/gpu/shaders/fxaa.frag")
             if(ANDROID)
                 # Pre-rotation of the finished frame for a display turned sideways.
                 list(APPEND shaders

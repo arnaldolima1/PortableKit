@@ -130,6 +130,9 @@ constexpr Entry kPortuguese[] = {
      "esticando a imagem. Preencher alarga (ou estreita) a visão do jogo até o formato da janela, mantendo a "
      "altura, e deixa a interface nas proporções do PSP."},
     {"Scaling filter", "Filtro de escala"},
+    {"Antialiasing", "Antisserrilhamento"},
+    {"Smooths the jagged edges of the picture. FXAA is a light pass over the finished picture that suits phones too; it softens text a little. Higher internal resolutions smooth edges as well, at a higher cost.",
+     "Suaviza as bordas serrilhadas da imagem. O FXAA é uma passada leve sobre a imagem pronta que serve também para celulares; ele suaviza um pouco o texto. Resoluções internas maiores também suavizam as bordas, a um custo maior."},
     {"Sharp", "Nítido"},
     {"Smooth", "Suave"},
     {"How the finished picture is scaled to the window: smooth (bilinear) or sharp (nearest pixel).",
