@@ -549,6 +549,44 @@ void deliver_choice(psprecomp::GuestMemory &memory) {
     s.dialog.hold(false);
 }
 
+// FILES: what one save folder holds. The block at +0x5F8 points to a file
+// list whose layout was read off Naruto Shippuden: Ultimate Ninja Impact,
+// which asks it about its install data at every boot: the most secure,
+// normal and system entries it takes (99, 8192, 5), then the three counts
+// answered, then three entry arrays, all null in that request. Only the
+// counts are answered; entries asked for are not written yet, and say so.
+std::uint32_t do_files(psprecomp::GuestMemory &memory, std::uint32_t params, const std::string &save_name) {
+    const std::string game_name = read_cstring(memory, params + param::kGameName, 13u);
+    const std::filesystem::path folder = savedata::savedata_root(state().memory_stick) / (game_name + save_name);
+    std::error_code error;
+    if (game_name.empty() || !std::filesystem::is_directory(folder, error)) return result::kLoadNoData;
+    const std::uint32_t list = memory.load32(params + 0x5F8u);
+    if (list == 0u || !memory.contains(list, 36u)) return result::kLoadParam;
+    static constexpr std::string_view kSystemFiles[] = {"PARAM.SFO", "ICON0.PNG", "ICON1.PMF", "ICON1.PNG",
+                                                        "PIC1.PNG", "SND0.AT3"};
+    std::uint32_t normal = 0u, system = 0u;
+    for (const auto &entry : std::filesystem::directory_iterator(folder, error)) {
+        if (!entry.is_regular_file()) continue;
+        std::string name = entry.path().filename().string();
+        if (name.ends_with(".part")) continue;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
+        const bool is_system = std::find(std::begin(kSystemFiles), std::end(kSystemFiles), name) != std::end(kSystemFiles);
+        (is_system ? system : normal) += 1u;
+    }
+    // A save written by this program keeps its data encrypted in its normal
+    // files; which of them a PSP would list as secure is not established.
+    memory.store32(list + 12u, 0u);
+    memory.store32(list + 16u, std::min(normal, memory.load32(list + 4u)));
+    memory.store32(list + 20u, std::min(system, memory.load32(list + 8u)));
+    if (memory.load32(list + 24u) != 0u || memory.load32(list + 28u) != 0u || memory.load32(list + 32u) != 0u)
+        std::cerr << "[savedata] FILES asked for the entries of " << game_name << save_name
+                  << "; only their counts are answered\n";
+    if (trace_savedata())
+        std::cerr << "[savedata] FILES " << game_name << save_name << ": " << normal << " normal, " << system
+                  << " system files\n";
+    return result::kOk;
+}
+
 std::uint32_t run_request(psprecomp::GuestMemory &memory, std::uint32_t params) {
     const std::uint32_t mode = memory.load32(params + param::kMode);
     const std::string save_name = save_name_at(memory, params + param::kSaveName);
@@ -592,6 +630,8 @@ std::uint32_t run_request(psprecomp::GuestMemory &memory, std::uint32_t params) 
         return do_sizes(memory, params);
     case kList:
         return do_list(memory, params);
+    case kFiles:
+        return do_files(memory, params, save_name);
     default:
         // Not used by this game. Report a parameter error so the guest takes
         // its failure path instead of reading results that were never written.
@@ -604,8 +644,8 @@ std::uint32_t run_request(psprecomp::GuestMemory &memory, std::uint32_t params) 
                 if (const std::uint32_t word = memory.load32(params + offset); word != 0u) {
                     std::cerr << "[savedata]   +" << psprecomp::hex32(offset) << " = " << psprecomp::hex32(word);
                     // A pointer into RAM: what it points at, too.
-                    if (memory.contains(word, 16u))
-                        for (std::uint32_t i = 0; i < 4u; ++i)
+                    if (memory.contains(word, 64u))
+                        for (std::uint32_t i = 0; i < 16u; ++i)
                             std::cerr << (i == 0u ? " -> " : " ") << psprecomp::hex32(memory.load32(word + i * 4u));
                     std::cerr << "\n";
                 }
