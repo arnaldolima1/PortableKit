@@ -319,6 +319,7 @@ void open_browser() {
         std::error_code ec;
         return fs::is_regular_file(folder / "textures.ini", ec);
     };
+    options.system_first = true;
     fs::path start = s.last_folder;
     if (start.empty()) {
         start = FileBrowser::home() / "Downloads";
@@ -413,9 +414,9 @@ std::string describe_current(const Review &r) {
         if (r.current.source == TexturePackLocation::Source::Installed) return "None";
         return "Folder missing: " + utf8(r.current.folder);
     }
-    std::string text = r.current_pack.problem.empty() ? count(r.current_pack.keys, "texture", "textures")
-                                                      : "Does not load";
-    text += ", " + human_size(r.current_pack.bytes);
+    if (!r.current_pack.problem.empty()) return trf("Does not load, {}", {human_size(r.current_pack.bytes)});
+    const std::string text =
+        trf("{} textures, {}", {std::to_string(r.current_pack.keys), human_size(r.current_pack.bytes)});
     return text;
 }
 
@@ -483,6 +484,8 @@ void start_copy() {
     go(Stage::Copying);
 }
 
+// What was found in the chosen folder, in a few lines, and what can be done
+// with it: the actions come first, the pack in use now after them.
 void review_screen(bool back) {
     State &s = state();
     if (back) {
@@ -491,78 +494,72 @@ void review_screen(bool back) {
     }
     const Review &r = s.review;
     const TexturePackCheck &c = r.check;
-    section("Import texture pack");
-    indented("From " + utf8(c.chosen));
-    if (!c.found()) {
-        indented(c.problem, colors::kDanger);
-    } else {
-        indented(c.layout + (c.made_for.empty() ? ""
-                                                : " It is installed as " + std::string(portablekit::game().disc_id) +
-                                                      ", the folder name this release reads."));
-        section("Pack to import");
-        info_row("Folder", utf8(c.folder));
-        if (c.keys > 0u) {
-            info_row("Textures", count(c.keys, "key", "keys") + ", hash " +
-                                     (c.hash == gpu::TexturePackHash::Xxh64 ? "xxh64" : "xxh32") +
-                                     (c.ignore_address ? ", addresses ignored" : ""));
-            info_row("Images", count(c.images, "file", "files") + ", " + human_size(c.bytes) + " in all " +
-                                   count(c.files, "file", "files"));
-            if (c.missing > 0u) {
-                std::string names;
-                for (const std::string &name : c.missing_names) names += (names.empty() ? "" : ", ") + name;
-                if (c.missing > c.missing_names.size()) names += ", …";
-                info_row("Missing images", std::to_string(c.missing) + " (" + names + ")");
-                indented("textures.ini names images that are not in the folder; those textures keep the game's own "
-                         "look.");
-            }
-        }
-        if (!c.ok()) indented("Cannot be imported: " + c.problem, colors::kDanger);
-        section("In use now");
-        info_row(r.current.source == TexturePackLocation::Source::Installed ? "Installed pack" : "Pack folder",
-                 describe_current(r));
-        if (r.current.source != TexturePackLocation::Source::Installed)
-            info_row("Used from", utf8(r.current.folder));
-        if (r.current.source == TexturePackLocation::Source::Variable)
-            indented(portablekit::env_name("TEXTURE_PACK") + " names this folder, so it stays in use until the variable is unset.",
+    const std::string id = portablekit::game().disc_id;
+    ImGui::Indent(px(16.0f));
+    ImGui::Dummy({0.0f, px(4.0f)});
+    heading(!c.found() ? "No texture pack in this folder" : c.ok() ? "Ready to install" : "This pack cannot be used");
+    ImGui::Dummy({0.0f, px(2.0f)});
+    paragraph(utf8(c.found() ? c.folder : c.chosen), colors::kTextDim);
+    ImGui::Unindent(px(16.0f));
+    ImGui::Dummy({0.0f, px(6.0f)});
+    if (!c.found() || !c.ok()) indented(c.problem, colors::kDanger);
+    if (c.found()) {
+        // One line: how big, and the release it was made for.
+        std::string summary = trf("{} textures, {}", {std::to_string(c.keys), human_size(c.bytes)});
+        if (!c.made_for.empty()) summary += "  ·  " + trf("made for {}, works on {}", {c.made_for, id});
+        indented(summary, colors::kText);
+        if (c.missing > 0u)
+            indented(trf("{} images missing: those textures keep the game's own look.", {std::to_string(c.missing)}),
                      colors::kDanger);
     }
 
-    ImGui::Dummy({0.0f, px(12.0f)});
     if (c.ok()) {
+        section("Install");
         const std::uint64_t needed = c.bytes + gpu::kTexturePackSpaceMargin;
         const bool room = !r.free_space || *r.free_space >= needed;
         std::error_code ec;
         const bool installed_exists = fs::exists(installed_folder(), ec);
         const bool is_installed = r.is_current && r.current.source == TexturePackLocation::Source::Installed;
         // Kept to two lines: the footer has no room for a path.
-        std::string copy_note = "Copies " + human_size(c.bytes) + " to textures/" + portablekit::game().disc_id +
-                                " in the data folder";
-        copy_note += r.free_space ? " (" + human_size(*r.free_space) + " free)." : std::string(".");
-        if (installed_exists) copy_note += " The pack there now moves to textures/.backup; nothing is deleted.";
+        std::string copy_note =
+            r.free_space ? trf("Copies {} to mods/textures/{} in the data folder ({} free).",
+                               {human_size(c.bytes), id, human_size(*r.free_space)})
+                         : trf("Copies {} to mods/textures/{} in the data folder.", {human_size(c.bytes), id});
+        if (installed_exists) copy_note += " " + std::string(tr("The pack there now is kept as a backup."));
         if (!room)
-            copy_note = "Not enough free space: the copy needs " + human_size(needed) + " and " +
-                        human_size(*r.free_space) + " is free. Use it where it is instead.";
+            copy_note = trf("Not enough free space: the copy needs {} and {} is free. Use it where it is instead.",
+                            {human_size(needed), human_size(*r.free_space)});
         if (is_installed) copy_note = "This is the installed pack already.";
-        const std::string label = installed_exists ? std::string("Copy and replace")
-                                                    : "Copy into " + std::string(portablekit::game().project_name) + "'s data folder";
-        // The focus starts on the first thing the player can do; the rows
-        // above are a scroll away.
+        const char *label = installed_exists ? "Copy and replace" : "Copy into the data folder";
+        // The focus starts on the first thing the player can do.
         if (room && !is_installed) focus_first();
-        if (button_row(label.c_str(), {!room || is_installed, {}, copy_note},
-                       installed_exists ? colors::kAccentBright : colors::kText))
-            start_copy();
+        if (button_row(label, {!room || is_installed, {}, copy_note}, colors::kAccentBright)) start_copy();
         const bool in_use = r.is_current && r.current.source != TexturePackLocation::Source::Variable;
         const std::string place_note =
-            in_use ? "This pack is the one in use already."
-                   : "Reads the pack from its folder and copies nothing, saving " + human_size(c.bytes) +
-                         ". The folder must stay where it is." +
-                         (installed_exists ? " The installed pack is kept, unused." : "");
+            in_use ? std::string("This pack is the one in use already.")
+                   : trf("Reads the pack from its folder and copies nothing, saving {}. The folder must stay where "
+                         "it is.",
+                         {human_size(c.bytes)});
         focus_first();
         if (button_row("Use it where it is", {in_use, {}, place_note})) use_in_place();
     }
+    ImGui::Dummy({0.0f, px(6.0f)});
     focus_first();
     if (button_row("Choose another folder", {false, {}, "Back to the folders."})) open_browser();
     if (button_row("Cancel", {false, {}, "Import nothing."})) close();
+
+    // The pack in use now, if any: what an install replaces.
+    if (r.current_pack.exists || r.current.source != TexturePackLocation::Source::Installed) {
+        section("In use now");
+        info_row(r.current.source == TexturePackLocation::Source::Installed ? "Installed pack" : "Pack folder",
+                 describe_current(r));
+        if (r.current.source != TexturePackLocation::Source::Installed)
+            info_row("Used from", utf8(r.current.folder));
+        if (r.current.source == TexturePackLocation::Source::Variable)
+            indented(portablekit::env_name("TEXTURE_PACK") +
+                         " names this folder, so it stays in use until the variable is unset.",
+                     colors::kDanger);
+    }
 }
 
 void copying_screen(bool back) {

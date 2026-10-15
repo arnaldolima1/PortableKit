@@ -248,6 +248,7 @@ void open_browser(Stage stage) {
     } else {
         options.choose_folder = "Back up to this folder";
     }
+    options.system_first = true;
     s.browser = std::make_unique<FileBrowser>(s.last_folder.empty() ? FileBrowser::home() : s.last_folder,
                                               std::move(options));
     go(stage);
