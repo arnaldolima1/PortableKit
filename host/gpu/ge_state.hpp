@@ -75,6 +75,13 @@ struct TextureState {
     float scale_v{1.0f};
     float offset_u{};
     float offset_v{};
+    // Where transformed vertices get their texture coordinates (TMAP, 0xC0):
+    // 0 their own UV, 1 the texture matrix applied to the projection source,
+    // 2 environment (shade) mapping, from the lights TEXSHADELS (0xC1) names.
+    std::uint32_t map_mode{};
+    std::uint32_t projection_source{};  // 0 position, 1 UV, 2 normalized normal, 3 normal
+    std::uint32_t shade_light_u{};
+    std::uint32_t shade_light_v{};
 };
 
 struct RenderTarget {

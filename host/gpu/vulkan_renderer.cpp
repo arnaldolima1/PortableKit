@@ -135,6 +135,7 @@ struct PushConstants {
 static_assert(sizeof(PushConstants) == 128u, "PushConstants must fit the guaranteed push constant size");
 constexpr float kPushFog = 1.0f;
 constexpr float kPushLighting = 2.0f;
+constexpr float kPushTexgen = 4.0f;
 
 struct GpuVertex {
     float x{}, y{}, z{}, w{1.0f};
@@ -232,9 +233,11 @@ struct ObjectBlock {
     std::array<float, 4> material_ambient{};
     std::array<float, 4> material_diffuse{};  // w: separate specular
     std::array<float, 4> material_specular{}; // w: reverse normals
+    std::array<float, 16> texture_matrix{};
+    std::array<float, 4> texgen{};            // x: map mode, y: projection source, z/w: shade lights u/v
 };
 
-static_assert(sizeof(ObjectBlock) == 144u, "ObjectBlock must match the std140 layout in ge.vert");
+static_assert(sizeof(ObjectBlock) == 224u, "ObjectBlock must match the std140 layout in ge.vert");
 
 // GPU vertex decode (<prefix>_GPU_DECODE): what the raw vertex shader needs to
 // decode and skin a draw's own bytes; the layout matches the Raw block in
@@ -1680,7 +1683,7 @@ struct VulkanRenderer::Impl {
     [[nodiscard]] bool interpolation_wanted() const;
     [[nodiscard]] double wanted_rate() const;
     void finish_interpolated_frame(VkImage source, std::uint32_t displayed, std::int64_t moment_us);
-    void record_draw_for_replay(const DrawCall &call, bool lit, std::uint32_t skinned, const DrawState &state,
+    void record_draw_for_replay(const DrawCall &call, bool uses_object, std::uint32_t skinned, const DrawState &state,
                                 VkDeviceSize vertex_start, VkBuffer indices, VkDeviceSize index_start,
                                 std::uint32_t count, std::uint32_t vertex_count, bool joined, bool raw = false);
     // `idle`: the kernel is waiting for real time, so the present costs the
@@ -6388,6 +6391,14 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     static const bool no_lighting = portablekit::env("NO_LIGHTING") != nullptr;
     static const bool no_fog = no_lighting || portablekit::env("NO_FOG") != nullptr;
     const bool lit = call.lighting_enabled && !no_lighting && !call.through && !call.clear_mode;
+    // Texture coordinates the vertex shader makes from the texture matrix or
+    // the lights (TMAP modes 1 and 2) rather than takes from the vertex.
+    // <prefix>_NO_TEXGEN uses the vertex's own UV for every draw, as before.
+    static const bool no_texgen = portablekit::env("NO_TEXGEN") != nullptr;
+    const bool texgen = call.texture.enabled && call.texture.map_mode != 0u && !no_texgen && !call.through &&
+                        !call.clear_mode;
+    // Lit and texgen draws read an object block.
+    const bool uses_object = lit || texgen;
     const bool use_material_color = !no_material_color && !call.has_vertex_color && !call.lighting_enabled;
     const auto to_gpu = [&](const Vertex &vertex) {
         GpuVertex out{};
@@ -6550,6 +6561,29 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
             for (std::size_t first = 0; first + 6u <= impl.scratch.size(); first += 6u)
                 clamp_through_quad(impl.scratch, first, static_cast<float>(call.texture.width),
                                    static_cast<float>(call.texture.height));
+        }
+        // The GE's clamp wrap mode keeps filtering inside the texture: no
+        // sample takes in a texel past its edge. A texture that is part of a
+        // render target is read from the target's copy, where the shader's
+        // own clamp cannot apply (it would take the whole target for the
+        // texture), so the range also stops at the edge texels' centres. An
+        // enlarging tile's own range stops only half a pixel in, which is less
+        // than half a texel: God of War: Ghost of Sparta enlarges its blurred
+        // shadow maps inside the buffer that holds them, next to other maps.
+        const bool clamp_u = call.texture.wrap_s != 0u, clamp_v = call.texture.wrap_t != 0u;
+        if (!no_sprite_clamp && call.texture.enabled && !call.clear_mode && (clamp_u || clamp_v)) {
+            const float last_u = static_cast<float>(call.texture.width) - 0.5f;
+            const float last_v = static_cast<float>(call.texture.height) - 0.5f;
+            for (GpuVertex &vertex : impl.scratch) {
+                if (clamp_u) {
+                    vertex.nx = std::min(std::max(vertex.nx, 0.5f), last_u);
+                    vertex.nz = std::max(std::min(vertex.nz, last_u), vertex.nx);
+                }
+                if (clamp_v) {
+                    vertex.ny = std::min(std::max(vertex.ny, 0.5f), last_v);
+                    vertex.w = std::max(std::min(vertex.w, last_v), vertex.ny);
+                }
+            }
         }
     }
 
@@ -6721,7 +6755,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     // changed, and the vertices follow whatever was written.
     const bool fogged = call.fog.enabled && !no_fog && !call.through && !call.clear_mode;
     const auto view_world = multiply(call.view, call.world);
-    if ((lit || fogged) && impl.environment_version != call.environment_version) {
+    if ((lit || fogged || texgen) && impl.environment_version != call.environment_version) {
         const LightingState &state = call.lighting;
         EnvironmentBlock environment{};
         environment.ambient = unpack_color(state.ambient_color, static_cast<float>(state.ambient_alpha) / 255.0f);
@@ -6743,9 +6777,9 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         if (!impl.write_uniform(&environment, sizeof(environment), impl.environment_offset)) return;
         impl.environment_version = call.environment_version;
     }
-    if (lit) {
+    if (uses_object) {
         const LightingState &state = call.lighting;
-        if (impl.material_version != call.material_version) {
+        if (lit && impl.material_version != call.material_version) {
             impl.material[0] = unpack_color(state.material_emissive, state.specular_power);
             impl.material[1] =
                 unpack_color(call.material_color, static_cast<float>(call.material_color >> 24u) / 255.0f);
@@ -6760,6 +6794,13 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
         object.material_ambient = impl.material[1];
         object.material_diffuse = impl.material[2];
         object.material_specular = impl.material[3];
+        if (texgen) {
+            object.texture_matrix = call.texture_matrix;
+            object.texgen = {static_cast<float>(call.texture.map_mode),
+                             static_cast<float>(call.texture.projection_source),
+                             static_cast<float>(call.texture.shade_light_u),
+                             static_cast<float>(call.texture.shade_light_v)};
+        }
         if (!impl.object_valid || std::memcmp(&object, &impl.last_object, sizeof(object)) != 0) {
             if (!impl.write_uniform(&object, sizeof(object), impl.object_offset)) return;
             impl.last_object = object;
@@ -7042,7 +7083,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     PushConstants push{};
     push.transform = multiply(call.projection, view_world);
     push.viewport = {static_cast<float>(kPspWidth), static_cast<float>(kPspHeight), call.through ? 1.0f : 0.0f,
-                     (fogged ? kPushFog : 0.0f) + (lit ? kPushLighting : 0.0f)};
+                     (fogged ? kPushFog : 0.0f) + (lit ? kPushLighting : 0.0f) + (texgen ? kPushTexgen : 0.0f)};
     push.view_z = {view_world[2], view_world[6], view_world[10], view_world[14]};
     // The GE's texture wrap register: clamp in u, in v, or repeat. The
     // sampler repeats; the fragment shader clamps the axes flagged here
@@ -7297,7 +7338,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                 vkCmdDraw(impl.command_buffer, draw_count, 1u, 0u, 0u);
             }
             perf::count_recorded_draws(1u);
-            impl.record_draw_for_replay(call, lit, skinned_first, state, vertex_start, VK_NULL_HANDLE, 0u,
+            impl.record_draw_for_replay(call, uses_object, skinned_first, state, vertex_start, VK_NULL_HANDLE, 0u,
                                         draw_count, drawn_vertices, false);
         } else {
             Impl::DrawGroup &group = impl.group;
@@ -7324,7 +7365,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                 rebase = 0u;
                 impl.group_skinned = skinned;
             }
-            impl.record_draw_for_replay(call, lit, skinned_first, state, vertex_start, impl.index_buffer,
+            impl.record_draw_for_replay(call, uses_object, skinned_first, state, vertex_start, impl.index_buffer,
                                         group.index_base, draw_count, vertex_count, join, raw);
             auto *indices = reinterpret_cast<std::uint8_t *>(impl.index_mapped) + impl.index_offset;
             if (rebase == 0u) {
@@ -7375,7 +7416,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     if (impl.interpolating) {
         const Impl::DrawState state{pipeline, texture_descriptor, lighting_offsets, vk_viewport, vk_scissor,
                                     blend_constants, push};
-        impl.record_draw_for_replay(call, lit, skinned_first, state, vertex_start,
+        impl.record_draw_for_replay(call, uses_object, skinned_first, state, vertex_start,
                                     direct ? impl.vertex_buffer : VK_NULL_HANDLE, index_start, draw_count,
                                     drawn_vertices, false, raw);
     }
@@ -7609,7 +7650,7 @@ bool VulkanRenderer::Impl::interpolation_wanted() const {
 
 // Keeps what drawing a draw again needs: a new group for a draw call the
 // frame recorded, or one more draw in the group it joined.
-void VulkanRenderer::Impl::record_draw_for_replay(const DrawCall &call, bool lit, std::uint32_t skinned,
+void VulkanRenderer::Impl::record_draw_for_replay(const DrawCall &call, bool uses_object, std::uint32_t skinned,
                                                   const DrawState &state, VkDeviceSize vertex_start,
                                                   VkBuffer indices, VkDeviceSize index_start, std::uint32_t count,
                                                   std::uint32_t vertex_count, bool joined, bool raw) {
@@ -7635,7 +7676,7 @@ void VulkanRenderer::Impl::record_draw_for_replay(const DrawCall &call, bool lit
         added.count = count;
         added.vertex_count = vertex_count;
         added.first_draw = static_cast<std::uint32_t>(frame.summaries.size());
-        if (lit) {
+        if (uses_object) {
             if (frame.objects.empty() || frame.object_offset != object_offset) {
                 frame.objects.push_back(last_object);
                 frame.object_offset = object_offset;

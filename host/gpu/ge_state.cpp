@@ -108,6 +108,8 @@ enum Command : std::uint32_t {
     kClutAddress = 0xB0,
     kClutAddressUpper = 0xB1,
     kTextureSize0 = 0xB8,
+    kTextureMapMode = 0xC0,
+    kTextureShadeLights = 0xC1,
     kTextureMode = 0xC2,
     kTextureFormat = 0xC3,
     kLoadClut = 0xC4,
@@ -718,6 +720,14 @@ void GeState::handle_command(const GuestMemory &memory, std::uint32_t command, s
     case kTextureWrap:
         texture_.wrap_s = data & 1u;
         texture_.wrap_t = (data >> 8u) & 1u;
+        break;
+    case kTextureMapMode:
+        texture_.map_mode = data & 3u;
+        texture_.projection_source = (data >> 8u) & 3u;
+        break;
+    case kTextureShadeLights:
+        texture_.shade_light_u = data & 3u;
+        texture_.shade_light_v = (data >> 8u) & 3u;
         break;
     case kTextureFunction:
         texture_.function = data & 7u;
