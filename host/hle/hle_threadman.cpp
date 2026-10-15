@@ -330,7 +330,8 @@ void register_semaphores(HleRegistrar &hle) {
             return;
         }
         const SceUID uid = kernel().allocate_uid();
-        kernel().semaphores[uid] = Semaphore{read_cstring(rt.memory(), arg(ctx, 0), 32u), arg(ctx, 1), initial, maximum, {}};
+        kernel().semaphores[uid] =
+            Semaphore{read_cstring(rt.memory(), arg(ctx, 0), 32u), arg(ctx, 1), initial, maximum, {}, initial};
         kernel().finish(ctx, as_unsigned(uid));
     });
     hle.add("ThreadManForUser", "sceKernelDeleteSema", [](Runtime &, AllegrexContext &ctx) {
@@ -402,6 +403,36 @@ void register_semaphores(HleRegistrar &hle) {
         } else {
             kernel().finish(ctx, error::kSemaZero);
         }
+    });
+    // sceKernelReferSemaStatus(uid, SceKernelSemaInfo *info): size, name[32],
+    // attr, initCount, currentCount, maxCount, numWaitThreads, as in
+    // pspthreadman.h; written up to the size the game gives. Naruto Shippuden:
+    // Ultimate Ninja Impact (ULES01537) signals a client's semaphore each
+    // vblank only while currentCount is below maxCount.
+    hle.add("ThreadManForUser", "sceKernelReferSemaStatus", [](Runtime &rt, AllegrexContext &ctx) {
+        const auto found = kernel().semaphores.find(as_signed(arg(ctx, 0)));
+        if (found == kernel().semaphores.end()) {
+            kernel().finish(ctx, error::kUnknownSemid);
+            return;
+        }
+        const Semaphore &sema = found->second;
+        auto &memory = rt.memory();
+        const std::uint32_t info = arg(ctx, 1);
+        const std::uint32_t size = info != 0u ? memory.load32(info) : 0u;
+        std::array<std::uint8_t, 56> bytes{};
+        const auto put = [&bytes](std::size_t at, std::uint32_t value) {
+            for (std::size_t i = 0; i < 4u; ++i) bytes[at + i] = static_cast<std::uint8_t>(value >> (8u * i));
+        };
+        put(0u, size);
+        for (std::size_t i = 0; i < 31u && i < sema.name.size(); ++i) bytes[4u + i] = static_cast<std::uint8_t>(sema.name[i]);
+        put(36u, sema.attributes);
+        put(40u, as_unsigned(sema.initial_count));
+        put(44u, as_unsigned(sema.count));
+        put(48u, as_unsigned(sema.max_count));
+        put(52u, static_cast<std::uint32_t>(sema.waiters.size()));
+        for (std::uint32_t i = 0; i < std::min<std::uint32_t>(size, static_cast<std::uint32_t>(bytes.size())); ++i)
+            memory.store8(info + i, bytes[i]);
+        kernel().finish(ctx, 0u);
     });
 }
 

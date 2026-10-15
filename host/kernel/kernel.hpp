@@ -148,6 +148,7 @@ struct Semaphore {
     std::int32_t count{};
     std::int32_t max_count{};
     std::deque<SceUID> waiters;
+    std::int32_t initial_count{}; // for sceKernelReferSemaStatus
 };
 
 struct EventFlag {

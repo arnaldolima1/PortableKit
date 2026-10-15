@@ -463,6 +463,7 @@ ThreadManForUser,0x9FA03CD3,sceKernelDeleteThread
 ThreadManForUser,0xAA73C935,sceKernelExitThread
 ThreadManForUser,0xB011B11F,sceKernelLockMutex
 ThreadManForUser,0xB7D098C6,sceKernelCreateMutex
+ThreadManForUser,0xBC6FEBC5,sceKernelReferSemaStatus
 ThreadManForUser,0xBC80EC7C,sceKernelExtendThreadStack
 ThreadManForUser,0xC07BB470,sceKernelCreateFpl
 ThreadManForUser,0xC68D9437,sceKernelStartVTimer
