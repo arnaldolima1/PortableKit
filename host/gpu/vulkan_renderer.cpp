@@ -6399,7 +6399,13 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                         !call.clear_mode;
     // Lit and texgen draws read an object block.
     const bool uses_object = lit || texgen;
-    const bool use_material_color = !no_material_color && !call.has_vertex_color && !call.lighting_enabled;
+    // The GE ignores lighting in through mode, whatever its enable says (the
+    // last 3D draw usually leaves it on), so a through vertex without a colour
+    // takes the material colour. God of War: Ghost of Sparta clears its shadow
+    // maps with such sprites; drawn white, they left a white ring in every map
+    // that showed as a dark rectangle around each character's shadow.
+    const bool use_material_color =
+        !no_material_color && !call.has_vertex_color && (call.through || !call.lighting_enabled);
     const auto to_gpu = [&](const Vertex &vertex) {
         GpuVertex out{};
         out.x = vertex.position[0];
