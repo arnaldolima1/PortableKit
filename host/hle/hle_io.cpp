@@ -228,16 +228,22 @@ bool trace_io() {
     return enabled;
 }
 
+std::uint64_t disc_file_size(const std::string &path, std::uint64_t size);
+
 // The disc file a path opens, by its name: the path itself, or for a sector
 // file (sce_lbn) the file that starts at that sector and is exactly that long,
-// which is how games that open their files by sector open them.
+// which is how games that open their files by sector open them. The length
+// may also be the replacement's: a game that sizes its files from the
+// directory listing (sceIoDopen, which gives a replaced file's size) asks
+// for that many bytes. God of War: Ghost of Sparta does.
 std::optional<std::string> disc_file_name(const std::string &path) {
     if (!io().disc) return std::nullopt;
     if (const auto lbn = parse_lbn_path(path)) {
         const auto named = io().disc->path_at(static_cast<std::uint32_t>(lbn->first));
         if (!named) return std::nullopt;
         const auto entry = io().disc->find(*named);
-        if (!entry || entry->directory || entry->size != lbn->second) return std::nullopt;
+        if (!entry || entry->directory) return std::nullopt;
+        if (entry->size != lbn->second && disc_file_size(*named, entry->size) != lbn->second) return std::nullopt;
         return named;
     }
     return path;
@@ -268,8 +274,9 @@ bool open_file_mod(const std::string &path, OpenFile &file) {
         std::cerr << "[mods] cannot open " << install::path_to_utf8(*mod) << " for " << *name << "\n";
         return false;
     }
+    const auto entry = io().disc->find(*name);
     log_once("file-mod:" + *name, "[mods] " + *name + " read from mods/files (" + std::to_string(size) +
-                                      " bytes, the disc's " + std::to_string(file.size) + ")");
+                                      " bytes, the disc's " + std::to_string(entry ? entry->size : 0u) + ")");
     file.kind = OpenFile::Kind::Host;
     file.host = std::move(stream);
     file.size = size;
