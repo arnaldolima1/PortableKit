@@ -8868,7 +8868,6 @@ void VulkanRenderer::shutdown() {
     vkDestroySampler(impl.device, impl.sharp_sampler, nullptr);
     vkDestroySampler(impl.device, impl.clamp_sampler, nullptr);
     vkDestroySampler(impl.device, impl.clamp_sharp_sampler, nullptr);
-    vkDestroyDescriptorPool(impl.device, impl.descriptor_pool, nullptr);
     vkDestroyDescriptorSetLayout(impl.device, impl.descriptor_layout, nullptr);
     vkDestroyDescriptorSetLayout(impl.device, impl.lighting_layout, nullptr);
     vkDestroyPipelineLayout(impl.device, impl.pipeline_layout, nullptr);
@@ -8885,6 +8884,10 @@ void VulkanRenderer::shutdown() {
     impl.held = {};
     impl.holding = false;
     impl.destroy_interpolation_targets();
+    // After everything above that frees sets from it: freeing a set from a
+    // destroyed pool corrupted MoltenVK's heap, and the program crashed as it
+    // quit, now and then.
+    vkDestroyDescriptorPool(impl.device, impl.descriptor_pool, nullptr);
     for (VkFence fence : impl.present_fences) vkDestroyFence(impl.device, fence, nullptr);
     if (impl.present_timer != VK_NULL_HANDLE) vkDestroyQueryPool(impl.device, impl.present_timer, nullptr);
     vkDestroyRenderPass(impl.device, impl.render_pass, nullptr);
