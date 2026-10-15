@@ -7459,8 +7459,17 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
     // shader has no discard. <prefix>_NO_ALPHA_VARIANTS keeps the one shader
     // that tests alpha for every draw, as before.
     static const bool no_alpha_variants = portablekit::env("NO_ALPHA_VARIANTS") != nullptr;
+    // The shader's alpha function: 0 no test, 1 never, 2..7 the GE's own
+    // comparisons. The GE numbers never 0 and always 1, so those two swap;
+    // they were passed as they are, and an always test discarded everything
+    // (Naruto Shippuden: Ultimate Ninja Impact's hero vanished mid-jump).
+    // <prefix>_OLD_ALPHA_FUNCTIONS passes them unswapped, as before.
+    static const bool old_alpha_functions = portablekit::env("OLD_ALPHA_FUNCTIONS") != nullptr;
+    std::uint32_t alpha_function = call.alpha_test.enabled ? call.alpha_test.function : 0u;
+    if (call.alpha_test.enabled && !old_alpha_functions)
+        alpha_function = alpha_function == 0u ? 1u : alpha_function == 1u ? 0u : alpha_function;
     key.alpha_test = no_alpha_variants || perf::alternate_off(perf::NewPath::Alpha) ||
-                     (!call.clear_mode && call.alpha_test.enabled && call.alpha_test.function != 0u);
+                     (!call.clear_mode && alpha_function != 0u);
     key.raw = raw;
     // Escape hatch for bisecting "nothing is visible" reports.
     static const bool no_cull = portablekit::env("NO_CULL") != nullptr;
@@ -7485,7 +7494,7 @@ void VulkanRenderer::submit(const DrawCall &call, const GuestMemory &memory) {
                                                     (call.texture.wrap_t != 0u ? 4.0f : 0.0f);
     push.texture_params = {call.texture.enabled ? 1.0f + wrap_flags : 0.0f, static_cast<float>(call.texture.function),
                            static_cast<float>(call.alpha_test.enabled ? call.alpha_test.reference : 0u),
-                           static_cast<float>(call.alpha_test.enabled ? call.alpha_test.function : 0u)};
+                           static_cast<float>(alpha_function)};
     // Through-mode texture coordinates are in texels, transformed ones in [0,1].
     push.uv_transform = call.through && call.texture.width != 0u
                             ? std::array<float, 4>{1.0f / static_cast<float>(call.texture.width),
