@@ -1207,10 +1207,9 @@ void GeState::send_draw(DrawCall &call) {
                 batch_indexed_ = true;
             }
             const std::size_t count = call.indices.empty() ? call.vertices.size() : call.indices.size();
-            triangle_indices(call.primitive, count, call.indices, call.vertices.size(), batch_scratch_);
             const auto base = static_cast<std::uint16_t>(batch_.vertices.size());
+            append_triangle_indices(call.primitive, count, call.indices, call.vertices.size(), base, batch_.indices);
             batch_.vertices.insert(batch_.vertices.end(), call.vertices.begin(), call.vertices.end());
-            for (const std::uint16_t index : batch_scratch_) batch_.indices.push_back(static_cast<std::uint16_t>(index + base));
             return;
         }
         flush_batch();
@@ -1493,16 +1492,34 @@ std::uint32_t GeState::execute(const GuestMemory &memory, std::uint32_t pc, std:
     const bool dump = run >= list_trace.first && run - list_trace.first < list_trace.second;
     if (dump) std::cerr << "[ge-list] run " << run << " from " << psprecomp::hex32(pc) << "\n";
 
+    // The list's words are read through a host pointer to a window of it, so
+    // a command costs no range check and no call while the list runs on in
+    // one region; a jump or call outside the window looks it up again.
+    // <prefix>_NO_LIST_WINDOW reads every word through GuestMemory instead.
+    static const bool no_window = portablekit::env("NO_LIST_WINDOW") != nullptr;
+    constexpr std::uint32_t kWindowBytes = 1024u;
+    const std::uint8_t *window = nullptr;
+    std::uint32_t window_base = 0u;
+    std::uint32_t window_bytes = 0u;
+
     for (std::uint32_t steps = 0; steps < 2'000'000u; ++steps) {
         if (stall != 0u && pc == stall) {
             flush_batch();
             return pc;
         }
-        if (!memory.contains(pc, 4u)) {
-            flush_batch();
-            return pc;
+        std::uint32_t word;
+        if (pc - window_base < window_bytes) {
+            std::memcpy(&word, window + (pc - window_base), sizeof(word));
+        } else {
+            if (!memory.contains(pc, 4u)) {
+                flush_batch();
+                return pc;
+            }
+            window = no_window ? nullptr : memory.raw_pointer(pc, kWindowBytes);
+            window_base = pc;
+            window_bytes = window != nullptr ? kWindowBytes : 0u;
+            word = memory.load32(pc);
         }
-        const std::uint32_t word = memory.load32(pc);
         if (dump && steps < list_trace_words)
             std::cerr << "[ge-list] " << psprecomp::hex32(pc) << " " << psprecomp::hex32(word) << "\n";
         const std::uint32_t command = word >> 24u;
