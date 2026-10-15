@@ -40,7 +40,10 @@ Icon icon_for(const std::filesystem::path &path) {
     std::error_code ec;
     const auto written = std::filesystem::last_write_time(path, ec);
     if (ec) return {};
-    const std::string key = path.string() + "|" + std::to_string(written.time_since_epoch().count());
+    // libc++ counts file times in a 128-bit integer, which to_string has no
+    // overload for.
+    const auto stamp = static_cast<long long>(written.time_since_epoch().count());
+    const std::string key = path.string() + "|" + std::to_string(stamp);
     if (const auto found = made.find(key); found != made.end()) return found->second;
     Icon icon;
     std::ifstream in(path, std::ios::binary);

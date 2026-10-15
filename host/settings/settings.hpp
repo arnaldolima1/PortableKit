@@ -61,6 +61,7 @@ struct Settings {
     bool half_rate{};                  // a 60 fps game drawn every other frame: 30 on screen, full speed
     bool movie_skip{true};             // START skips a movie (games whose profile allows it)
     bool movie_mods{true};             // play mods/movies/NAME.264 in place of the game's movie NAME
+    bool file_mods{true};              // read mods/files/PATH in place of the disc's file PATH
     PerfDisplay perf{PerfDisplay::Off};
 
     // Text

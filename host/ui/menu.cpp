@@ -28,6 +28,7 @@
 #include "input/motion.hpp"
 #include "install/installer.hpp"
 #include "install/user_data.hpp"
+#include "kernel/file_mods.hpp"
 #include "perf/frame_stats.hpp"
 #include "save_data/save_transfer.hpp"
 #include "settings/settings.hpp"
@@ -290,8 +291,9 @@ LauncherPage Menu::page(int tab, bool back) {
     return result;
 }
 
-// Mods: in the mods folder of the data folder, remastered movies
-// (mods/movies) and HD texture packs (mods/textures); and START skipping movies.
+// Mods: in the mods folder of the data folder, replaced game files
+// (mods/files), remastered movies (mods/movies) and HD texture packs
+// (mods/textures); and START skipping movies.
 void Menu::mods() {
     if (texture_pack_screen(back_)) return;
     settings::Settings &s = settings::current();
@@ -334,6 +336,31 @@ void Menu::mods() {
                                                          "movie NAME. Kit Movie Tools puts them there."}))
         open_folder(folder);
 #endif
+    section("Game files");
+    {
+        RowOptions o = options_for("mods.files",
+                                   "Reads the files a mod puts in the mods/files folder of the game's data in place "
+                                   "of the disc's files at the same path (mods/files/PSP_GAME/USRDIR/…): "
+                                   "translations, models, sounds. Takes effect the next time the game loads them.");
+        const std::size_t files = file_mods::count();
+        if (files == 0u && !o.disabled) {
+            o.disabled = true;
+            o.note = "No replaced files found";
+        } else if (!o.disabled) {
+            o.note = trf("{} found", {std::to_string(files)});
+        }
+        if (choice_row("Replaced files", s.file_mods ? "On" : "Off", o)) {
+            s.file_mods = !s.file_mods;
+            settings::save();
+        }
+#if !defined(PORTABLEKIT_ANDROID_APP)
+        const std::filesystem::path files_folder = file_mods::folder();
+        if (!files_folder.empty() &&
+            button_row("Open the files folder",
+                       {false, {}, "Where a mod's files go, in the disc's folders: PSP_GAME/USRDIR/…"}))
+            open_folder(files_folder);
+#endif
+    }
     section("Texture packs");
     {
         RowOptions o = options_for("video.texture_pack",
