@@ -99,9 +99,13 @@ fs::path backups_directory() {
 
 // Percent-encodes a path for a file:// URL.
 std::string file_url(const std::string &path) {
-    std::string url = "file://";
+    // A Windows path (C:\Users\...) becomes file:///C:/Users/...: its
+    // separators turned to slashes and its drive letter's colon kept.
+    std::string url = path.empty() || path[0] == '/' ? "file://" : "file:///";
     for (const unsigned char c : path) {
-        if (std::isalnum(c) != 0 || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') {
+        if (c == '\\') {
+            url += '/';
+        } else if (std::isalnum(c) != 0 || c == '/' || c == '-' || c == '_' || c == '.' || c == '~' || c == ':') {
             url += static_cast<char>(c);
         } else {
             char escaped[4];

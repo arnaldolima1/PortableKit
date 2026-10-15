@@ -93,21 +93,6 @@ float font_gap() { return Layer::get().font_size() * 0.5f; }
 
 int cycle(int value, int delta, int count) { return ((value + delta) % count + count) % count; }
 
-// Percent-encodes a path for a file:// URL.
-std::string file_url(const std::string &path) {
-    std::string url = "file://";
-    for (const unsigned char c : path) {
-        if (std::isalnum(c) != 0 || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') {
-            url += static_cast<char>(c);
-        } else {
-            char escaped[4];
-            std::snprintf(escaped, sizeof(escaped), "%%%02X", c);
-            url += escaped;
-        }
-    }
-    return url;
-}
-
 float gain(const settings::Settings &s) { return s.mute ? 0.0f : static_cast<float>(s.volume) / 100.0f; }
 
 class Menu {
@@ -186,7 +171,7 @@ bool Menu::frame() {
     const bool start = ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false);
     // Back closes the font list, or the save import and export, before it
     // closes the menu.
-    const bool font_list_was_open = (tab_id() == kVideo && (font_list_open() || texture_pack_screen_open())) ||
+    const bool font_list_was_open = (tab_id() == kVideo && font_list_open()) || (tab_id() == kMods && texture_pack_screen_open()) ||
                                     (tab_id() == kSystem && save_screen_open());
     back_ = back || pad_back;
 
@@ -287,7 +272,7 @@ LauncherPage Menu::page(int tab, bool back) {
     // Back closes what is open inside the page first: the font list, the
     // texture packs, the save import and export, a confirmation, a field
     // being edited.
-    const bool inner_open = (tab_id() == kVideo && (font_list_open() || texture_pack_screen_open())) ||
+    const bool inner_open = (tab_id() == kVideo && font_list_open()) || (tab_id() == kMods && texture_pack_screen_open()) ||
                             (tab_id() == kSystem && save_screen_open());
     result.back_used = inner_open || was_editing_ || confirm_ != Confirm::None || texture_pack_import_busy();
     back_ = back;
@@ -305,47 +290,78 @@ LauncherPage Menu::page(int tab, bool back) {
     return result;
 }
 
-// Mods: remastered movies a mod puts in mods/movies of the data folder.
+// Mods: in the mods folder of the data folder, remastered movies
+// (mods/movies) and HD texture packs (mods/textures); and START skipping movies.
 void Menu::mods() {
+    if (texture_pack_screen(back_)) return;
     settings::Settings &s = settings::current();
     std::filesystem::path folder;
     try {
         folder = install::user_data_directory() / "mods" / "movies";
     } catch (const std::exception &) {
     }
-    std::vector<std::pair<std::string, std::uintmax_t>> movies;
+    std::size_t movies = 0;
     std::error_code ec;
     if (!folder.empty())
         for (const auto &entry : std::filesystem::directory_iterator(folder, ec))
-            if (entry.path().extension() == ".264")
-                movies.emplace_back(entry.path().stem().string(), entry.file_size(ec));
-    std::sort(movies.begin(), movies.end());
+            if (entry.path().extension() == ".264") ++movies;
+    if (portablekit::game().start_skips_movies) {
+        section("Movies");
+        if (toggle_row("Skip movies with START", s.movie_skip,
+                       options_for("video.movie_skip", "START during a movie ends it and goes on with the game."))) {
+            s.movie_skip = !s.movie_skip;
+            settings::save();
+        }
+    }
     section("Remastered movies");
     RowOptions o = options_for("video.movie_mods",
                                "Plays the remastered movies a mod puts in the mods/movies folder of the game's "
                                "data (NAME.264, NAME the game's movie) in place of the game's own, with the "
                                "game's sound.");
-    if (movies.empty() && !o.disabled) {
+    if (movies == 0u && !o.disabled) {
         o.disabled = true;
         o.note = "No remastered movies found";
     } else if (!o.disabled) {
-        o.note = trf("{} found", {std::to_string(movies.size())});
+        o.note = trf("{} found", {std::to_string(movies)});
     }
     if (choice_row("Remastered movies", s.movie_mods ? "On" : "Off", o)) {
         s.movie_mods = !s.movie_mods;
         settings::save();
     }
+#if !defined(PORTABLEKIT_ANDROID_APP)
     if (!folder.empty() &&
-        button_row("Open the mods folder", {false, {}, "Where remastered movies go: NAME.264, for the game's "
-                                                       "movie NAME. Kit Movie Tools puts them there."}))
+        button_row("Open the movies folder", {false, {}, "Where remastered movies go: NAME.264, for the game's "
+                                                         "movie NAME. Kit Movie Tools puts them there."}))
         open_folder(folder);
-    for (const auto &[name, bytes] : movies)
-        info_row(name.c_str(), std::to_string(bytes / 1048576u) + " MiB");
+#endif
+    section("Texture packs");
+    {
+        RowOptions o = options_for("video.texture_pack",
+                                   trf("Draws an HD texture pack in PPSSPP's format from mods/textures/{} in the "
+                                       "data folder instead of the game's textures.",
+                                       {portablekit::game().disc_id}));
+        // The footer shows the note under the description: what is loaded,
+        // or where the pack was looked for.
+        if (o.note.empty()) {
+            const std::string status = renderer().texture_pack_status();
+            o.note = status == "Not installed" ? trf("No pack in {}", {renderer().texture_pack_folder()}) : status;
+            // A pack used in place that has moved: its path is on the "Pack
+            // used from" row below; the footer has room for its name only.
+            if (status.rfind("Folder missing: ", 0) == 0)
+                o.note = "Pack folder missing: " +
+                         install::path_to_utf8(install::path_from_utf8(status.substr(16)).filename());
+        }
+        if (choice_row("Texture pack", s.texture_pack ? "On" : "Off", o)) {
+            s.texture_pack = !s.texture_pack;
+            renderer().set_texture_pack(s.texture_pack);
+            settings::save();
+        }
+    }
+    texture_pack_rows();
 }
 
 void Menu::video() {
     if (font_list(back_)) return;
-    if (texture_pack_screen(back_)) return;
     settings::Settings &s = settings::current();
     section("Picture");
     resolution_row();
@@ -398,29 +414,6 @@ void Menu::video() {
         renderer().set_sharp_textures(s.sharp_textures);
         settings::save();
     }
-    {
-        RowOptions o = options_for("video.texture_pack",
-                                   trf("Draws an HD texture pack in PPSSPP's format from textures/{} in the data "
-                                       "folder instead of the game's textures.",
-                                       {portablekit::game().disc_id}));
-        // The footer shows the note under the description: what is loaded,
-        // or where the pack was looked for.
-        if (o.note.empty()) {
-            const std::string status = renderer().texture_pack_status();
-            o.note = status == "Not installed" ? trf("No pack in {}", {renderer().texture_pack_folder()}) : status;
-            // A pack used in place that has moved: its path is on the "Pack
-            // used from" row below; the footer has room for its name only.
-            if (status.rfind("Folder missing: ", 0) == 0)
-                o.note = "Pack folder missing: " +
-                         install::path_to_utf8(install::path_from_utf8(status.substr(16)).filename());
-        }
-        if (choice_row("Texture pack", s.texture_pack ? "On" : "Off", o)) {
-            s.texture_pack = !s.texture_pack;
-            renderer().set_texture_pack(s.texture_pack);
-            settings::save();
-        }
-    }
-    texture_pack_rows();
     section("Timing");
     {
         struct Mode {
@@ -1538,8 +1531,7 @@ void Menu::system() {
     if (!saved_log_path().empty()) info_row("Log", saved_log_path());
 #else
     if (button_row("Open the data folder", {false, {}, trf("Show {}'s data folder in the file manager.", {portablekit::game().project_name})})) {
-        if (!SDL_OpenURL(file_url(data_dir).c_str()))
-            std::cout << "[menu] cannot open " << data_dir << ": " << SDL_GetError() << "\n";
+        open_folder(install::path_from_utf8(data_dir));
     }
 #endif
     if (button_row("Set up game data again…",

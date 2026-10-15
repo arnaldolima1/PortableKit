@@ -732,7 +732,7 @@ void texture_pack_rows() {
     if (button_row("Import texture pack…", {false, {}, import_note})) open_browser();
 #if !defined(PORTABLEKIT_ANDROID_APP)
     if (button_row("Open the textures folder",
-                   {false, {}, "Show the textures folder in the data folder, where imported packs go."}))
+                   {false, {}, "Show mods/textures in the data folder, where imported packs go."}))
         open_folder(textures_root());
 #endif
     if (!settings.texture_pack_folder.empty()) info_row("Pack used from", settings.texture_pack_folder);

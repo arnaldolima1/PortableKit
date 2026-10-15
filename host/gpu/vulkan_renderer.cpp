@@ -5974,7 +5974,23 @@ bool VulkanRenderer::texture_pack_held() const {
     return impl_ && impl_->pack_held && !impl_->pack_applied && !impl_->pack;
 }
 
-std::filesystem::path VulkanRenderer::textures_root() { return install::user_data_directory() / "textures"; }
+// mods/textures in the data folder. Packs were once in textures/: the first
+// call moves that folder here.
+std::filesystem::path VulkanRenderer::textures_root() {
+    const std::filesystem::path data = install::user_data_directory();
+    const std::filesystem::path root = data / "mods" / "textures";
+    static const bool moved = [&] {
+        std::error_code ec;
+        const std::filesystem::path old = data / "textures";
+        if (!std::filesystem::is_directory(old, ec) || std::filesystem::exists(root, ec)) return false;
+        std::filesystem::create_directories(root.parent_path(), ec);
+        std::filesystem::rename(old, root, ec);
+        if (ec) std::cerr << "[textures] cannot move " << old.string() << " to " << root.string() << ": " << ec.message() << "\n";
+        return !ec;
+    }();
+    (void)moved;
+    return root;
+}
 
 std::string VulkanRenderer::texture_pack_folder() const {
     const std::string in_place = settings::current().texture_pack_folder;

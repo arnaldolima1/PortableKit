@@ -145,11 +145,12 @@ constexpr std::uint32_t kStartButton = 0x0008u;
 // second: the press that started the movie must not end it.
 constexpr std::uint64_t kSkipAfterPictures = 15u;
 
-// GameProfile::start_skips_movies; <prefix>_NO_MOVIE_SKIP turns it off.
+// GameProfile::start_skips_movies and the player's setting (the Mods page);
+// <prefix>_NO_MOVIE_SKIP turns it off.
 bool movie_skip_allowed() {
     static const bool allowed =
         portablekit::game().start_skips_movies && portablekit::env("NO_MOVIE_SKIP") == nullptr;
-    return allowed;
+    return allowed && settings::current().movie_skip;
 }
 
 // Starts skipping `state`'s movie when START has gone down since the last
